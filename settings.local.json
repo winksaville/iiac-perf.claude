@@ -13,7 +13,8 @@
       "Bash(vc-x1 finalize:*)",
       "Bash(vc-x1 chid:*)",
       "Bash(jj bookmark:*)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(jj commit:*)"
     ]
   }
 }
