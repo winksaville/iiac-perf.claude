@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo install:*)",
+      "Bash(iiac-perf:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)",
+      "Bash(jj st:*)",
+      "Bash(jj log:*)",
+      "Bash(jj git:*)",
+      "Bash(vc-x1 finalize:*)"
+    ]
+  }
+}
