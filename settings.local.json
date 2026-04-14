@@ -10,7 +10,8 @@
       "Bash(jj st:*)",
       "Bash(jj log:*)",
       "Bash(jj git:*)",
-      "Bash(vc-x1 finalize:*)"
+      "Bash(vc-x1 finalize:*)",
+      "Bash(vc-x1 chid:*)"
     ]
   }
 }
