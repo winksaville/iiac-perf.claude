@@ -14,7 +14,10 @@
       "Bash(vc-x1 chid:*)",
       "Bash(jj bookmark:*)",
       "Bash(cargo run:*)",
-      "Bash(jj commit:*)"
+      "Bash(jj commit:*)",
+      "Bash(./target/release/iiac-perf)",
+      "Bash(./target/release/iiac-perf all:*)",
+      "Bash(./target/release/iiac-perf bogus:*)"
     ]
   }
 }
