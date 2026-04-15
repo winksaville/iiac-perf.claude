@@ -1,0 +1,1 @@
+- [No output after finalize](feedback_no_output_after_finalize.md) — nothing (prose or tools) after `vc-x1 finalize`; put recaps in the Checkpoint-2 approval message instead.
