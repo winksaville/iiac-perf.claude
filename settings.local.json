@@ -17,7 +17,8 @@
       "Bash(jj commit:*)",
       "Bash(./target/release/iiac-perf)",
       "Bash(./target/release/iiac-perf all:*)",
-      "Bash(./target/release/iiac-perf bogus:*)"
+      "Bash(./target/release/iiac-perf bogus:*)",
+      "Bash(jj diff *)"
     ]
   }
 }
