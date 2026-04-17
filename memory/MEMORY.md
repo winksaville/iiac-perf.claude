@@ -1,1 +1,1 @@
-- [Plans evolve — flesh out each -devN when it starts](feedback_plans_evolve.md) — only detail the current step in chores; later steps stay as short previews
+
