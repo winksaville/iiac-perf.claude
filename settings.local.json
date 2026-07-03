@@ -28,7 +28,12 @@
       "Bash(pkill -f \"iiac-perf.*ice-ps\")",
       "Bash(./target/release/iiac-perf -d 2 ice-ps-1 ice-ps-2)",
       "Bash(echo \"exit=$?\")",
-      "Bash(./target/release/iiac-perf -d 1 ice-ps-1t ice-ps-2t)"
+      "Bash(./target/release/iiac-perf -d 1 ice-ps-1t ice-ps-2t)",
+      "Bash(timeout 60 ./target/release/iiac-perf -d 1 ice-rr-1t ice-rr-2t)",
+      "Bash(sed -i 's/\"iceoryx2 pub\\\\/sub round-trip \\(1 thread\\)\"/\"ice-ps-1t: iceoryx2 pub\\\\/sub round-trip \\(1 thread\\)\"/' src/benches/ice_ps_1t.rs)",
+      "Bash(sed -i 's/\"iceoryx2 pub\\\\/sub round-trip \\(2 threads\\)\"/\"ice-ps-2t: iceoryx2 pub\\\\/sub round-trip \\(2 threads\\)\"/' src/benches/ice_ps_2t.rs)",
+      "Bash(sed -i 's/\"iceoryx2 req\\\\/res round-trip \\(1 thread\\)\"/\"ice-rr-1t: iceoryx2 req\\\\/res round-trip \\(1 thread\\)\"/' src/benches/ice_rr_1t.rs)",
+      "Bash(sed -i 's/\"iceoryx2 req\\\\/res round-trip \\(2 threads\\)\"/\"ice-rr-2t: iceoryx2 req\\\\/res round-trip \\(2 threads\\)\"/' src/benches/ice_rr_2t.rs)"
     ]
   }
 }
