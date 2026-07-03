@@ -18,7 +18,13 @@
       "Bash(./target/release/iiac-perf)",
       "Bash(./target/release/iiac-perf all:*)",
       "Bash(./target/release/iiac-perf bogus:*)",
-      "Bash(jj diff *)"
+      "Bash(jj diff *)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(cargo new *)",
+      "Bash(cargo add *)",
+      "Bash(/tmp/claude-1000/-home-wink-data-prgs-rust-iiac-perf/75b85bd0-79cb-448d-b434-6696b16d542f/scratchpad/ice-proto/target/release/ice-proto *)",
+      "Bash(vc-x1 push *)"
     ]
   }
 }
