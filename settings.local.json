@@ -24,7 +24,11 @@
       "Bash(cargo new *)",
       "Bash(cargo add *)",
       "Bash(/tmp/claude-1000/-home-wink-data-prgs-rust-iiac-perf/75b85bd0-79cb-448d-b434-6696b16d542f/scratchpad/ice-proto/target/release/ice-proto *)",
-      "Bash(vc-x1 push *)"
+      "Bash(vc-x1 push *)",
+      "Bash(pkill -f \"iiac-perf.*ice-ps\")",
+      "Bash(./target/release/iiac-perf -d 2 ice-ps-1 ice-ps-2)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(./target/release/iiac-perf -d 1 ice-ps-1t ice-ps-2t)"
     ]
   }
 }
