@@ -24,6 +24,7 @@
       "Bash(awk *)",
       "Bash(sed *)",
       "Bash(python3 *)",
+      "Bash(journalctl *)",
       "Read(//home/wink/data/prgs/rust/zc-ring-x1/src/**)",
       "Read(//home/wink/data/prgs/rust/zc-ring-x1/**)",
       "Read(//home/wink/data/prgs/rust/vc-template-x1/notes/**)",
