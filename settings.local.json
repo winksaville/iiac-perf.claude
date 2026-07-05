@@ -40,7 +40,8 @@
       "Read(//home/wink/data/prgs/rust/zc-ring-x1/**)",
       "Bash(cargo check *)",
       "Bash(git ls-remote *)",
-      "Bash(jj show *)"
+      "Bash(jj show *)",
+      "Bash(./target/release/iiac-perf -d 1 zcr --pin 0,1)"
     ]
   }
 }
