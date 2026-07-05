@@ -45,7 +45,9 @@
       "Bash(./target/release/iiac-perf -d 1 zcr-spin --pin 0,1)",
       "Bash(journalctl --since \"2026-07-05 04:00\" --until \"2026-07-05 14:00\" --utc -q)",
       "Bash(journalctl --since \"2026-07-05 04:00\" --until \"2026-07-05 14:00\" --utc -q -k)",
-      "Bash(qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement org.kde.Solid.PowerManagement.currentProfile)"
+      "Bash(qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement org.kde.Solid.PowerManagement.currentProfile)",
+      "Read(//sys/power/**)",
+      "Read(//sys/bus/usb/devices/**)"
     ]
   }
 }
