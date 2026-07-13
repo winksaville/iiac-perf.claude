@@ -48,7 +48,8 @@
       "Bash(qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement org.kde.Solid.PowerManagement.currentProfile)",
       "Read(//sys/power/**)",
       "Read(//sys/bus/usb/devices/**)",
-      "Bash(echo \"exit $?\")"
+      "Bash(echo \"exit $?\")",
+      "Bash(scp ~/.cargo/bin/iiac-perf r5-7600x:.cargo/bin/iiac-perf)"
     ]
   }
 }
