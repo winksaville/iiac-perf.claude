@@ -50,7 +50,9 @@
       "Read(//sys/bus/usb/devices/**)",
       "Bash(echo \"exit $?\")",
       "Bash(scp ~/.cargo/bin/iiac-perf r5-7600x:.cargo/bin/iiac-perf)",
-      "Bash(./target/release/iiac-perf -v min-now -d 0.01)"
+      "Bash(./target/release/iiac-perf -v min-now -d 0.01)",
+      "Bash(sed -i 's/let \\(hist, outer, inner, duration_s, suspended_s\\) = harness::run_adaptive\\(\\\\&mut bench, cfg\\);/let \\(hist, outer, inner, duration_s, suspended_s, block_stats\\) =\\\\n        harness::run_adaptive\\(\\\\&mut bench, cfg\\);/' src/benches/*.rs)",
+      "Bash(sed -i 's/^        suspended_s,$/        suspended_s,\\\\n        block_stats.as_ref\\(\\),/' src/benches/*.rs)"
     ]
   }
 }
