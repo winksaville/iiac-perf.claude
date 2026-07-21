@@ -59,7 +59,10 @@
       "Bash(command -v paru yay pikaur trizen)",
       "WebFetch(domain:aur.archlinux.org)",
       "Bash(COMP_LINE=\"iiac-perf -\" COMP_POINT=11 COMP_TYPE=63 CARAPACE_SHELL=bash CARAPACE_DESCRIPTION_LENGTH=0 carapace iiac-perf bash iiac-perf -)",
-      "Bash(nu -c 'carapace iiac-perf nushell iiac-perf - | from json | first 4')"
+      "Bash(nu -c 'carapace iiac-perf nushell iiac-perf - | from json | first 4')",
+      "Bash(env -u XDG_CONFIG_HOME HOME=/tmp/claude-1000/-home-wink-data-prgs-rust-iiac-perf/785e15d2-f3c7-4dc2-b9e2-d33404fac040/scratchpad/fakehome sh -c './target/debug/iiac-perf add-completion-yaml && ./target/debug/iiac-perf | tail -2')",
+      "Bash(./target/debug/iiac-perf add-completion-yaml *)",
+      "Bash(env -u XDG_CONFIG_HOME -u HOME ./target/debug/iiac-perf add-completion-yaml)"
     ]
   }
 }
