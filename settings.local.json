@@ -62,7 +62,19 @@
       "Bash(nu -c 'carapace iiac-perf nushell iiac-perf - | from json | first 4')",
       "Bash(env -u XDG_CONFIG_HOME HOME=/tmp/claude-1000/-home-wink-data-prgs-rust-iiac-perf/785e15d2-f3c7-4dc2-b9e2-d33404fac040/scratchpad/fakehome sh -c './target/debug/iiac-perf add-completion-yaml && ./target/debug/iiac-perf | tail -2')",
       "Bash(./target/debug/iiac-perf add-completion-yaml *)",
-      "Bash(env -u XDG_CONFIG_HOME -u HOME ./target/debug/iiac-perf add-completion-yaml)"
+      "Bash(env -u XDG_CONFIG_HOME -u HOME ./target/debug/iiac-perf add-completion-yaml)",
+      "Bash(timeout 20 ssh -o BatchMode=yes r5-7600x 'grep -m1 \"model name\" /proc/cpuinfo' 2>&1)",
+      "Bash(timeout 20 ssh -o BatchMode=yes r5-7600x 'cd data/prgs/rust/iiac-perf 2>/dev/null && pwd && jj log -r \"@ | main | fix-calibration\" --no-pager 2>&1 | head -20' 2>&1. \\(Note: it doesn't have th latest code so you'll need to scp any uncommitted code.)",
+      "Bash(timeout 20 ssh -o BatchMode=yes r5-7600x 'ls ~/.cargo/bin/ 2>&1 | head; echo ---; command -v cargo git' 2>&1)",
+      "Bash(timeout 20 ssh -o BatchMode=yes r5-7600x 'cd data/prgs/rust/iiac-perf && ~/.cargo/bin/jj st --no-pager 2>&1 | head -20' 2>&1)",
+      "Bash(timeout 120 scp -o BatchMode=yes target/release/iiac-perf target/debug/iiac-perf r5-7600x:/tmp/)",
+      "Bash(echo \"rc=$?\")",
+      "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x 'cat > /tmp/iiac-rel && chmod +x /tmp/iiac-rel && ls -l /tmp/iiac-rel' < target/release/iiac-perf 2>&1)",
+      "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x '/tmp/iiac-rel calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN|dither fit\\\\\\(lowq1|dither fit\\\\\\(p99\"' 2>&1)",
+      "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x '/tmp/iiac-rel calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN\"' 2>&1)",
+      "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x 'cat > /tmp/iiac-dbg && chmod +x /tmp/iiac-dbg && ls -l /tmp/iiac-dbg' < target/debug/iiac-perf 2>&1)",
+      "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x '/tmp/iiac-dbg calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN\"' 2>&1)",
+      "Bash(timeout 120 ssh -o BatchMode=yes r5-7600x 'timeout 40 taskset -c 0 bash -c \"while :; do :; done\" >/dev/null 2>&1 & sp=$!; sleep 1; /tmp/iiac-rel calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN|impossible\"; kill $sp 2>/dev/null; echo \"--- spinner stopped\"' 2>&1)"
     ]
   }
 }

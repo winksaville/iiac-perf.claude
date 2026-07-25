@@ -1,0 +1,612 @@
+Modified regular file src/main.rs:
+    ...
+ 365  365:         overhead::W_LOW_SAMPLES,
+ 366  366:         overhead::N_LOW,
+ 367  367:     );
+      368:     println!(
+      369:         "  l_low             {:.3} ns/sample  (same, no timer pair; w_low-l_low = frame/call)",
+      370:         o.cal_l_low_ns,
+      371:     );
+ 368  372:     for (name, n, p) in [
+ 369  373:         ("d_low ", overhead::N_LOW, &o.cal_d_low),
+ 370  374:         ("d_high", overhead::N_HIGH, &o.cal_d_high),
+ 371  375:     ] {
+ 372  376:         println!(
+ 373  377:             "  {name} @ N={n:<6} mean {:.3} | p99mean {:.3} | fast {:.3} | medwin {:.3} | spread {:.3} | min {} ns",
+ 374  378:             p.mean_ns,
+ 374  379:             p.mean_p99_ns,
+ 374  380:             p.mean_fast_ns,
+ 374  381:             p.median_window_ns,
+ 374  382:             p.window_spread_ns,
+ 374  383:             p.min_ns,
+ 375  384:         );
+ 376  385:     }
+ 377  386:     println!();
+ 378  387:     println!(
+ 378  388:         "Alternative fits (production fit is p99lowq{:.1}%):",
+      389:         overhead::DITHER_LOW_Q[overhead::DITHER_PROD_Q] * 100.0
+ 378  390:     );
+ 379  391:     for (kind, low, high) in [
+ 380     :         ("full  ", o.cal_d_low.mean_ns, o.cal_d_high.mean_ns),
+ 381     :         ("p99   ", o.cal_d_low.mean_p99_ns, o.cal_d_high.mean_p99_ns),
+ 382     :         (
+ 383     :             "medwin",
+ 384     :             o.cal_d_low.median_window_ns,
+ 385     :             o.cal_d_high.median_window_ns,
+ 386     :         ),
+ 387  391:     ]overhead::fit_candidates(&o.cal_d_low, &o.cal_d_high) {
+ 388  392:         let (frame_sample, loop_per_iter) = overhead::two_point_fit(low, high);
+ 389  393:         println!("  {kind:<8}  frame/sample {frame_sample:.4} ns, loop/iter {loop_per_iter:.6} ns");
+ 390  394:     }
+ 391  395:     println!();
+ 392  396:     println!(
+    ...
+ 553  557:     let amp_coeff = overhead::N_HIGH as f64 / (overhead::N_HIGH - overhead::N_LOW) as f64;
+ 554  558:     info!(
+ 555  559:         "calibration params: warmup={}, dither N_LOW={} ({}x{}), \
+ 556  560:          N_HIGH={} ({}x{}), fast={}/{}, span={}, w_low {}x{}, noise_amp={:.4}",
+ 557  561:         overhead::CAL_WARMUP,
+ 558  562:         overhead::N_LOW,
+ 559  563:         overhead::DITHER_WINDOWS,
+ 560  564:         overhead::DITHER_LOW_SAMPLES,
+ 561  565:         overhead::N_HIGH,
+ 562  566:         overhead::DITHER_WINDOWS,
+ 563  567:         overhead::DITHER_HIGH_SAMPLES,
+      568:         overhead::DITHER_FAST_WINDOWS,
+      569:         overhead::DITHER_WINDOWS,
+ 564  570:         overhead::DITHER_SPAN,
+ 565  571:         overhead::W_LOW_WINDOWS,
+ 566  572:         overhead::W_LOW_SAMPLES,
+    ...
+ 578  584:     debug!("ticks_per_ns: {ticks_per_ns:.6}");
+ 579  585: 
+ 580  586:     debug!(
+ 581     :         "calibration raw: w_low={:.4} ns, d_low_p99={:.4} ns, d_high_p99={:.4} ns",
+ 582     :         overhead.cal_w_low_ns, overhead.cal_d_low.mean_p99_ns, overhead.cal_d_high.mean_p99_ns,
+      587:         "calibration raw: w_low={:.4} ns, l_low={:.4} ns, d_low_q={:.4} ns, \
+      588:          d_high_q={:.4} ns",
+      589:         overhead.cal_w_low_ns,
+      590:         overhead.cal_l_low_ns,
+      591:         overhead.cal_d_low.low_q_ns[overhead::DITHER_PROD_Q],
+      592:         overhead.cal_d_high.low_q_ns[overhead::DITHER_PROD_Q],
+ 583  593:     );
+ 584  594:     debug!(
+ 585  595:         "calibration fit: frame_call={:.4} ns, frame_sample={:.4} ns, loop_per_iter={:.4} ns",
+    ...
+ 601  611:     };
+ 602  612:     println!("Calibration:");
+ 603  613:     println!(
+ 604  614:         "  frame/call        {:>7} ns  (per sample, call-to-call, amortized; sizes inner, not subtracted)",
+ 605  615:         harness::fmt_commas_f64(overhead.frame_call_ns, 3)
+ 606  616:     );
+ 607  617:     println!(
+ 608  618:         "  frame/sample      {:>7} ns  (per sample, in-interval, dithered; subtracted, /inner per call)",
+ 609  619:         harness::fmt_commas_f64(overhead.frame_sample_ns, 3)
+ 610  620:     );
+ 611  621:     println!(
+ 612  622:         "  loop/iter         {:>7} ns  (per inner-loop iterationcall; subtracted as-is)",
+ 613  623:         harness::fmt_commas_f64(overhead.loop_per_iter_ns, 3)
+ 614  624:     );
+      625:     for v in &overhead.violations {
+      626:         println!("  WARNING           calibration is not physically consistent: {v}");
+      627:     }
+      628:     if !overhead.violations.is_empty() {
+      629:         println!(
+      630:             "  WARNING           {} attempts all failed; treat the constants above as \
+      631:              unmeasured, not as values",
+      632:             overhead::CAL_MAX_ATTEMPTS,
+      633:         );
+      634:     }
+ 615  635:     println!("  cal pin           {cal_pin_display}");
+ 616  636:     println!("  bench pin         {}", pin::plan_summary(&pin_cores));
+ 617  637:     println!("  sleep inhibit     {inhibit_status}");
+    ...
+Modified regular file src/overhead.rs:
+   1    1: //! Apparatus-overhead calibration, dithered and amortized.
+   2    2: //!
+   3    3: //! Three constants, from twothree measurement passes:
+   4    4: //!
+   5     : //! - **Dithered two-point fit** (mean-below-p99 at `N_LOW` /
+   6     : //!   `N_HIGH`, random sub-quantum phase dither per sample):
+   7     : //!   slope → `loop_per_iter_ns`, intercept → `frame_sample_ns`,
+   8     : //!   the in-interval timer-pair slice a recorded sample actually
+   9     : //!   contains. Both are subtracted from reported values.
+  10     : //! - **Window pass** (min over amortized window means at `N_LOW`):
+  11     : //!   with the dithered slope, yields `frame_call_ns`, the full
+        5: //! - **Dithered two-point fit** (low sample quantile at `N_LOW` /
+        6: //!   `N_HIGH`, random sub-quantum phase dither per sample) gives
+        7: //!   the slope → `loop_per_iter_ns`, subtracted per call.
+        8: //! - **Window pass** and **loop-only pass** (min over amortized
+        9: //!   window means at `N_LOW`, identical but for the per-sample
+       10: //!   timer pair): their difference is `frame_call_ns`, the full
+  12   11: //!   call-to-call cost of taking a sample — sizes the experiment,
+  13   12: //!   never subtracted (most of it sits outside recorded
+  14   13: //!   intervals).
+       14: //! - **Dither `N_LOW` window minimum minus the loop-only pass**
+       15: //!   gives `frame_sample_ns`, the in-interval timer-pair slice a
+       16: //!   recorded sample actually contains, subtracted per sample.
+       17: //!
+       18: //! Every pass drives the same [`run_inner`], so the loop term
+       19: //! cancels exactly in both subtractions instead of being
+       20: //! estimated at a different call site.
+       21: //!
+       22: //! The slope and the intercept come from *different* estimators
+       23: //! on purpose. A low quantile parks both fit points on the clock
+       24: //! lattice floor; in the slope that shared ~1-quantum bias
+       25: //! cancels, but in an extrapolated intercept it lands undiluted —
+       26: //! enough to drive the intercept negative on a quiet machine
+       27: //! (r5-7600x: fit intercept -1.2828 ns against a paired 8.23 ns,
+       28: //! three runs). So the intercept is instead a difference of two
+       29: //! same-`N_LOW` measurements, which cannot be levered by a
+       30: //! contaminated long point.
+  15   31: //!
+  16   32: //! Dither makes the ~10 ns clock quantum a zero-mean error that
+  17     : //! averages away in means (validated on r5-7600x: frame_sample
+  18     : //! repeats to ±0.06 ns within a frequency regime). See
+  19     : //! notes/design.md#dithering-random-phase-injection and
+  20     : //! notes/design.md#timer-overhead-in-interval-vs-call-to-call.
+       33: //! averages away in means (validated on r5-7600x: `frame_sample`
+       34: //! 8.23 / 8.25 / 8.29 ns, a 0.062 ns spread, within a frequency
+       35: //! regime). See notes/design.md#dithering-random-phase-injection,
+       36: //! notes/design.md#timer-overhead-in-interval-vs-call-to-call and
+       37: //! notes/chores/chores-04.md#one-sided-contamination-and-the-two-point-fit.
+  21   38: 
+  22   39: use std::hint::black_box;
+  23   40: use std::time::{Duration, Instant};
+    ...
+  28   45: /// boost to ramp before the first measurement.
+  29   46: pub const CAL_WARMUP: u64 = 100_000;
+  30   47: 
+       48: /// Attempts before a physically impossible calibration is
+       49: /// reported rather than retried. Interference is transient, so a
+       50: /// retry usually lands on a quieter moment; a persistent
+       51: /// violation is a real problem the user needs to see.
+       52: pub const CAL_MAX_ATTEMPTS: u32 = 3;
+       53: 
+  31   54: /// Inner-loop count for the low-N calibration point.
+  32   55: pub const N_LOW: u64 = 100;
+  33   56: 
+    ...
+  36   59: /// the fitted intercept small.
+  37   60: pub const N_HIGH: u64 = 10_000;
+  38   61: 
+  39     : /// Samples per window in the call-to-call pass at [`N_LOW`]. The
+  40     : /// window's ±1-quantum error divides by this: ~0.001 ns at a
+  41     : /// ~10 ns quantum.
+  42     : pub const W_LOW_SAMPLES: u64 = 10_000;
+       62: /// Samples per window in the call-to-call and loop-only passes at
+       63: /// [`N_LOW`]. The window's ±1-quantum error divides by this:
+       64: /// ~0.01 ns at a ~10 ns quantum.
+       65: ///
+       66: /// - Lowered from 10,000 with the window count raised to match,
+       67: ///   leaving the total budget unchanged. Window *duration* is
+       68: ///   what decides whether min-over-windows can find a clean
+       69: ///   window: at 10,000 samples an unoptimized build ran ~7.9 ms
+       70: ///   per window, so under a continuous competitor every window
+       71: ///   was contaminated and `l_low` came out *above* the interval
+       72: ///   containing it. Shorter windows fit between preemptions.
+       73: /// - The two passes are differenced, so their windows must be
+       74: ///   comparable in duration or the difference is meaningless.
+       75: pub const W_LOW_SAMPLES: u64 = 1_000;
+  43   76: 
+  44     : /// Windows in the call-to-call pass; the minimum is kept. The min
+  45     : /// sheds windows inflated by preemption or a frequency dip while
+  46     : /// staying amortized (each candidate is already a window mean).
+  47     : pub const W_LOW_WINDOWS: u64 = 100;
+       77: /// Windows in the call-to-call and loop-only passes; the minimum
+       78: /// is kept. The min sheds windows inflated by preemption or a
+       79: /// frequency dip while staying amortized (each candidate is
+       80: /// already a window mean).
+       81: pub const W_LOW_WINDOWS: u64 = 1_000;
+  48   82: 
+  49   83: /// Dither span in neutral spin iterations (~0.4-0.5 ns each →
+  50   84: /// ~26-32 ns, spanning ~3 clock quanta). A random 0..span delay
+    ...
+  55   89: 
+  56   90: /// Dithered-fit windows per point (each yields one window mean;
+  57   91: /// the spread across windows is the dispersion signal).
+       92: ///
+       93: /// - Raised from 20 with the per-window sample counts halved, so
+       94: ///   the total sample budget is unchanged. More windows sharpen
+       95: ///   the dispersion diagnostics (spread, median-window) at no
+       96: ///   cost.
+  58   97: pub const DITHER_WINDOWS: u64 = 2040;
+  59   98: 
+  60   99: /// Dithered-fit samples per window at [`N_LOW`].
+  61  100: pub const DITHER_LOW_SAMPLES: u64 = 5_0002_500;
+  62  101: 
+  63  102: /// Dithered-fit samples per window at [`N_HIGH`] (samples are
+  64  103: /// ~100× longer, so fewer keep the wall cost comparable).
+  65  104: pub const DITHER_HIGH_SAMPLES: u64 = 500250;
+      105: 
+      106: /// Fastest window means averaged for the `fast` diagnostic — the
+      107: /// lower 10% of [`DITHER_WINDOWS`].
+      108: ///
+      109: /// - **Not** the production estimator: window-level tail
+      110: ///   selection assumes interference is sporadic enough that some
+      111: ///   window escapes it. Under a continuous competitor no
+      112: ///   `N_HIGH` window does (measured: fastest window 142,644 ns
+      113: ///   against a 76,573 ns sample floor), so this reads as
+      114: ///   contaminated as the means. Kept as a logged comparison
+      115: ///   because its *divergence* from the sample quantiles is a
+      116: ///   contamination signal. See
+      117: ///   notes/chores/chores-04.md#one-sided-contamination-and-the-two-point-fit.
+      118: pub const DITHER_FAST_WINDOWS: u64 = 4;
+      119: 
+      120: /// Candidate discard fractions for the low-quantile estimator:
+      121: /// drop this fraction of the fastest samples, then take the
+      122: /// minimum of what remains (so `0.0` is the strict minimum).
+      123: ///
+      124: /// - Scheduler interference is one-sided, so the *low* tail is
+      125: ///   the uncontaminated part of the distribution — but its very
+      126: ///   bottom is where samples that rounded down on the ~10 ns
+      127: ///   clock lattice collect. Discarding a slice sheds those
+      128: ///   without giving up the robustness.
+      129: /// - The aim is a *stable* estimate, not an unbiased one: a
+      130: ///   small repeatable bias is subtracted consistently, whereas
+      131: ///   contamination is neither small nor repeatable.
+      132: pub const DITHER_LOW_Q: [f64; 4] = [0.0, 0.001, 0.01, 0.05];
+      133: 
+      134: /// Index into [`DITHER_LOW_Q`] selecting the discard fraction
+      135: /// used for the production **slope**.
+      136: ///
+      137: /// - Only the slope. The fit's intercept carries the quantile's
+      138: ///   ~1-quantum lattice bias undiluted, where the slope cancels
+      139: ///   it; `frame_sample_ns` is derived by pairing instead.
+      140: pub const DITHER_PROD_Q: usize = 2;
+  66  141: 
+  67  142: /// Xorshift64* PRNG for dither lengths. No external dep; phase
+  68  143: /// randomization needs rough uniformity, not statistical rigor.
+    ...
+ 128  203:     /// Full mean over all samples — unbiased under dither but
+ 129  204:     /// absorbs interrupt spikes.
+ 130  205:     pub mean_ns: f64,
+ 131     :     /// Mean of samples ≤ p99 — sheds one-sided interrupt
+ 132     :     /// contamination at a small estimable bias. The fit input.
+      206:     /// Mean of samples ≤ p99 — sheds the top 1% of samples.
+      207:     /// Retained for comparison and regime fingerprinting; too
+      208:     /// little trim to survive contention, so no longer the fit
+      209:     /// input.
+ 133  210:     pub mean_p99_ns: f64,
+      211:     /// Mean of the fastest [`DITHER_FAST_WINDOWS`] window means.
+      212:     /// A diagnostic, not the fit input — see
+      213:     /// [`DITHER_FAST_WINDOWS`].
+      214:     pub mean_fast_ns: f64,
+      215:     /// Low quantiles, one per [`DITHER_LOW_Q`] entry: the
+      216:     /// smallest sample remaining after discarding that fraction
+      217:     /// of the fastest. Index into it with the same position.
+      218:     pub low_q_ns: [f64; DITHER_LOW_Q.len()],
+      219:     /// Minimum window mean — the amortized in-interval cost per
+      220:     /// sample, least-disturbed window. Pairs with the loop-only
+      221:     /// pass to derive `frame_sample` without extrapolating.
+      222:     pub min_window_ns: f64,
+ 134  223:     /// Median of per-window means — robust to a bad window
+ 135  224:     /// without snapping (window means are not lattice-valued).
+ 136  225:     pub median_window_ns: f64,
+    ...
+ 145  234: #[derive(Debug)]
+ 146  235: pub struct Overhead {
+ 147  236:     /// Call-to-call cost of taking one sample (full timer-pair
+ 148     :     /// apparatus cost, clock-read latencies included), in ns.
+ 149     :     /// Sizes the experiment ([`crate::harness`]'s `pick_inner`);
+ 150     :     /// most of it sits *outside* recorded intervals, so it is
+ 151     :     /// never subtracted from reported values.
+      237:     /// apparatus cost, clock-read latencies included), in ns —
+      238:     /// the window pass minus the loop-only pass. Sizes the
+      239:     /// experiment ([`crate::harness`]'s `pick_inner`); most of it
+      240:     /// sits *outside* recorded intervals, so it is never
+      241:     /// subtracted from reported values. Clamped at 0, with a
+      242:     /// warning, if the two passes disagree.
+ 152  243:     pub frame_call_ns: f64,
+ 153  244:     /// In-interval timer-pair slice a recorded sample contains,
+ 154     :     /// in ns — the dithered fit's intercept. Subtracted per
+ 155     :     /// sample (amortized by `inner`); see
+ 156     :     /// [`Overhead::adjust_per_call_ns`].
+      245:     /// in ns — the dithered `N_LOW` window minimum minus the
+      246:     /// loop-only pass, both amortized per-sample costs over the
+      247:     /// same [`run_inner`]. Subtracted per sample (amortized by
+      248:     /// `inner`); see [`Overhead::adjust_per_call_ns`].
+ 157  249:     pub frame_sample_ns: f64,
+ 158  250:     /// Per-inner-iteration loop overhead (branch + `black_box`),
+ 159  251:     /// in ns — the dithered fit's slope. Subtracted per call.
+    ...
+ 163  255:     /// Raw call-to-call window minimum at [`N_LOW`] (ns).
+ 164  256:     /// Preserved for `-v` logging and cache provenance.
+ 165  257:     pub cal_w_low_ns: f64,
+      258:     /// Raw loop-only window minimum at [`N_LOW`] (ns) — the same
+      259:     /// pass without the per-sample timer pair. `cal_w_low_ns`
+      260:     /// minus this is [`Overhead::frame_call_ns`].
+      261:     pub cal_l_low_ns: f64,
+ 166  262:     /// Raw dithered point at [`N_LOW`].
+ 167  263:     pub cal_d_low: DitherPoint,
+ 168  264:     /// Raw dithered point at [`N_HIGH`].
+ 169  265:     pub cal_d_high: DitherPoint,
+ 170  266:     /// Wall-clock duration of the full calibration run.
+ 171  267:     pub cal_duration: Duration,
+      268:     /// Physical impossibilities detected in this result, empty
+      269:     /// when the calibration is self-consistent. Non-empty means
+      270:     /// the constants were kept only so the run can continue —
+      271:     /// report them rather than presenting the values as measured.
+      272:     pub violations: Vec<String>,
+ 172  273: }
+ 173  274: 
+ 174  275: impl Overhead {
+    ...
+ 197  298:     }
+ 198  299: }
+ 199  300: 
+ 200     : /// Run the dithered two-point calibration plus the call-to-call
+ 201     : /// window pass and return the fitted [`Overhead`]. Blocks for
+      301: /// The inner loop, as one compiled copy shared by every
+      302: /// calibration pass.
+      303: ///
+      304: /// - `#[inline(never)]` is load-bearing: `frame_call_ns` is a
+      305: ///   difference of two passes, so any per-call-site codegen
+      306: ///   difference in this loop lands in the result at full size.
+      307: ///   One copy makes it cancel instead. See
+      308: ///   notes/chores/chores-04.md#call-site-codegen-and-the-frame_call-subtraction.
+      309: /// - The call itself costs one call per *sample*, not per
+      310: ///   iteration, so it does not enter `loop_per_iter_ns`; it is a
+      311: ///   constant present in every pass, and cancels too.
+      312: #[inline(never)]
+      313: fn run_inner(bench: &mut EmptyBench, inner: u64) {
+      314:     for _ in 0..inner {
+      315:         black_box(bench.step());
+      316:     }
+      317: }
+      318: 
+      319: /// Calibrate, retrying while the result is physically impossible.
+      320: ///
+      321: /// - A violation (see [`Overhead::violations`]) means interference
+      322: ///   corrupted the run, not that the apparatus is slow, so another
+      323: ///   attempt on a quieter moment is the right response.
+      324: /// - After [`CAL_MAX_ATTEMPTS`] the last attempt is returned with
+      325: ///   its violations attached, for the caller to report. A clamped
+      326: ///   constant is never passed off as a measurement.
+      327: pub fn calibrate() -> Overhead {
+      328:     let mut last = calibrate_once();
+      329:     for attempt in 2..=CAL_MAX_ATTEMPTS {
+      330:         if last.violations.is_empty() {
+      331:             return last;
+      332:         }
+      333:         log::warn!(
+      334:             "calibration attempt {} of {CAL_MAX_ATTEMPTS} was physically impossible \
+      335:              ({}); retrying",
+      336:             attempt - 1,
+      337:             last.violations.join("; "),
+      338:         );
+      339:         last = calibrate_once();
+      340:     }
+      341:     last
+      342: }
+      343: 
+      344: /// One calibration pass: the dithered two-point measurement plus
+      345: /// the call-to-call and loop-only window passes. Blocks for
+ 202  346: /// ~150-200 ms on a typical modern x86; logs raw points and the
+ 203  347: /// alternative fits at debug level.
+ 204  348: pub fn calibratecalibrate_once() -> Overhead {
+ 205  349:     let mut bench = EmptyBench;
+ 206  350:     let mut dither = Dither::new();
+ 207  351:     let cal_start = Instant::now();
+    ...
+ 215  359:     log_dither_point("d_high", &d_high);
+ 216  360:     log_alt_fits(&d_low, &d_high);
+ 217  361: 
+ 218     :     // The production fit uses mean-below-p99 at both points — the
+ 219     :     // tightest aggregation in validation (r5-7600x: frame_sample
+ 220     :     // 8.2 ± 0.06 ns, slope stable to 5 significant figures).
+ 221     :     let (frame_raw, loop_per_iter_ns) = two_point_fit(d_low.mean_p99_ns, d_high.mean_p99_ns);
+ 222     :     let frame_sample_ns = frame_raw.max(0.0);
+ 223     : 
+ 224     :     // Call-to-call: one window pass at N_LOW; the dithered slope
+ 225     :     // supplies the loop share (better measured than a second
+ 226     :     // window point would be).
+      362:     // Call-to-call: two window passes at N_LOW differing only in
+      363:     // the per-sample timer pair, so the loop term cancels in the
+      364:     // subtraction rather than being estimated from the dithered
+      365:     // slope (a different call site, and in an unoptimized build a
+      366:     // ~12% different loop — see
+      367:     // notes/chores/chores-04.md#call-site-codegen-and-the-frame_call-subtraction).
+ 227  368:     let w_low = measure_window(&mut bench, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+ 228     :     let frame_call_ns = (w_low - N_LOW as f64 * loop_per_iter_ns).max(0.0);
+      369:     let l_low = measure_loop_only(&mut bench, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+      370:     let frame_call_raw = w_low - l_low;
+      371: 
+      372:     // The slope still comes from the two-point fit over a low
+      373:     // sample quantile: interference is one-sided and lands hardest
+      374:     // on the long N_HIGH samples, so only the low tail is
+      375:     // uncontaminated.
+      376:     let (fit_intercept, loop_per_iter_ns) = two_point_fit(
+      377:         d_low.low_q_ns[DITHER_PROD_Q],
+      378:         d_high.low_q_ns[DITHER_PROD_Q],
+      379:     );
+      380: 
+      381:     // frame_sample is *not* taken from that intercept: it is a
+      382:     // difference of two same-N measurements over the same
+      383:     // run_inner, so no long point can lever it negative. Both
+      384:     // terms are amortized per-sample costs, min over windows.
+      385:     let frame_sample_raw = d_low.min_window_ns - l_low;
+      386:     log::debug!(
+      387:         "frame_sample: paired={frame_sample_raw:.4} ns (d_low_minwin={:.4}, l_low={l_low:.4}), \
+      388:          fit-intercept={fit_intercept:.4} ns",
+      389:         d_low.min_window_ns,
+      390:     );
+      391:     log::debug!(
+      392:         "frame_call: paired={frame_call_raw:.4} ns (w_low={w_low:.4}, l_low={l_low:.4}), \
+      393:          slope-based={:.4} ns",
+      394:         w_low - N_LOW as f64 * loop_per_iter_ns,
+      395:     );
+      396: 
+      397:     // Physical plausibility. These are not statistical tests: each
+      398:     // one is a statement that cannot be false of a real apparatus,
+      399:     // so a failure means the measurement is invalid, not unlucky.
+      400:     let mut violations = Vec::new();
+      401:     if frame_call_raw <= 0.0 {
+      402:         violations.push(format!(
+      403:             "frame/call is non-positive ({frame_call_raw:.4} ns; w_low={w_low:.4}, \
+      404:              l_low={l_low:.4}): taking a sample cannot cost nothing"
+      405:         ));
+      406:     }
+      407:     if frame_sample_raw < 0.0 {
+      408:         violations.push(format!(
+      409:             "frame/sample is negative ({frame_sample_raw:.4} ns; d_low_minwin={:.4}, \
+      410:              l_low={l_low:.4}): a timed interval cannot be shorter than the loop it contains",
+      411:             d_low.min_window_ns,
+      412:         ));
+      413:     }
+      414:     if frame_sample_raw > frame_call_raw {
+      415:         violations.push(format!(
+      416:             "frame/sample ({frame_sample_raw:.4} ns) exceeds frame/call \
+      417:              ({frame_call_raw:.4} ns): the timer cost inside the interval cannot \
+      418:              exceed the whole timer cost"
+      419:         ));
+      420:     }
+      421: 
+      422:     let frame_call_ns = frame_call_raw.max(0.0);
+      423:     let frame_sample_ns = frame_sample_raw.max(0.0);
+ 229  424: 
+ 230  425:     Overhead {
+ 231  426:         frame_call_ns,
+ 232  427:         frame_sample_ns,
+ 233  428:         loop_per_iter_ns,
+ 234  429:         cal_w_low_ns: w_low,
+      430:         cal_l_low_ns: l_low,
+ 235  431:         cal_d_low: d_low,
+ 236  432:         cal_d_high: d_high,
+ 237  433:         cal_duration: cal_start.elapsed(),
+      434:         violations,
+ 238  435:     }
+ 239  436: }
+ 240  437: 
+    ...
+ 250  447:         for _ in 0..samples {
+ 251  448:             dither.spin();
+ 252  449:             let start = Instant::now();
+ 253     :             for _ in 0..inner {
+ 254     :                 black_box(bench.step());
+ 255     :             }
+      450:             run_inner(&mut bench, inner);
+ 256  451:             let e = start.elapsed().as_nanos() as u64;
+ 257  452:             sum += u128::from(e);
+ 258  453:             all.push(e);
+    ...
+ 269  464:     window_means.sort_unstable_by(|a, b| a.total_cmp(b));
+ 270  465:     let median_window_ns = window_means[window_means.len() / 2];
+ 271  466:     let window_spread_ns = window_means[window_means.len() - 1] - window_means[0];
+      467:     let fast = (DITHER_FAST_WINDOWS as usize).clamp(1, window_means.len());
+      468:     let mean_fast_ns = window_means[..fast].iter().sum::<f64>() / fast as f64;
+      469: 
+      470:     let mut low_q_ns = [0.0; DITHER_LOW_Q.len()];
+      471:     for (slot, frac) in low_q_ns.iter_mut().zip(DITHER_LOW_Q) {
+      472:         let idx = ((n as f64 * frac) as usize).min(n - 1);
+      473:         *slot = all[idx] as f64;
+      474:     }
+ 272  475: 
+ 273  476:     DitherPoint {
+ 274  477:         mean_ns,
+ 275  478:         mean_p99_ns,
+      479:         mean_fast_ns,
+      480:         low_q_ns,
+      481:         min_window_ns: window_means[0],
+ 276  482:         median_window_ns,
+ 277  483:         window_spread_ns,
+ 278  484:         min_ns: all[0],
+    ...
+ 290  496:         let window = Instant::now();
+ 291  497:         for _ in 0..samples {
+ 292  498:             let start = Instant::now();
+ 293     :             for _ in 0..inner {
+ 294     :                 black_box(bench.step());
+ 295     :             }
+      499:             run_inner(bench, inner);
+ 296  500:             black_box(start.elapsed());
+ 297  501:         }
+ 298  502:         let per_sample = window.elapsed().as_nanos() as f64 / samples as f64;
+    ...
+ 303  507:     min_ns
+ 304  508: }
+ 305  509: 
+      510: /// [`measure_window`] with the per-sample timer pair removed: the
+      511: /// loop's own cost per `inner` iterations, same window shape, same
+      512: /// min-over-windows estimator, same [`run_inner`].
+      513: ///
+      514: /// - Paired with [`measure_window`], the difference is the
+      515: ///   call-to-call framing cost with the loop term cancelled
+      516: ///   exactly — no fitted slope, no second call site.
+      517: fn measure_loop_only(bench: &mut EmptyBench, windows: u64, samples: u64, inner: u64) -> f64 {
+      518:     let mut min_ns = f64::INFINITY;
+      519:     for _ in 0..windows {
+      520:         let window = Instant::now();
+      521:         for _ in 0..samples {
+      522:             run_inner(bench, inner);
+      523:         }
+      524:         let per_sample = window.elapsed().as_nanos() as f64 / samples as f64;
+      525:         if per_sample < min_ns {
+      526:             min_ns = per_sample;
+      527:         }
+      528:     }
+      529:     min_ns
+      530: }
+      531: 
+ 306  532: /// Two-point linear fit over the [`N_LOW`] / [`N_HIGH`] pair,
+ 307  533: /// shared by the production fit, the alternative-fit logging, and
+ 308  534: /// the `calibrate` command's diagnostic output. Returns
+    ...
+ 321  547: /// Debug-log one dithered point's aggregates.
+ 322  548: fn log_dither_point(name: &str, p: &DitherPoint) {
+ 323  549:     log::debug!(
+ 324  550:         "dither {name}: mean={:.4} p99mean={:.4} fast={:.4} medwin={:.4} spread={:.4} min={} ns",
+ 325  551:         p.mean_ns,
+ 326  552:         p.mean_p99_ns,
+      553:         p.mean_fast_ns,
+ 327  554:         p.median_window_ns,
+ 328  555:         p.window_spread_ns,
+ 329  556:         p.min_ns,
+ 330  557:     );
+ 331  558: }
+ 332  559: 
+ 333  560: /// Debug-log the three alternative fits (full / p99 / fast / medwin) so
+ 334  561: /// estimator agreement stays observable run to run; `p99fast` is the
+ 335  562: /// production fit. Under contention the others go negative while
+ 335  563: /// `fast` should not — that divergence is the diagnostic.
+ 336  564: fn log_alt_fits(d_low: &DitherPoint, d_high: &DitherPoint) {
+ 337  565:     for (kind, low, high) in [
+ 338     :         ("full", d_low.mean_ns, d_high.mean_ns),
+ 339     :         ("p99", d_low.mean_p99_ns, d_high.mean_p99_ns),
+ 340     :         ("medwin", d_low.median_window_ns, d_high.median_window_ns),
+ 341  565:     ]fit_candidates(d_low, d_high) {
+ 342  566:         let (intercept, slope) = two_point_fit(low, high);
+ 343  567:         log::debug!(
+ 344  568:             "dither fit({kind}): in-interval framing={intercept:.4} ns, loop_per_iter={slope:.6} ns"
+ 345  569:         );
+ 346  570:     }
+ 347  571: }
+      572: 
+      573: /// Every aggregation the two points can be fitted through, as
+      574: /// `(label, low, high)` — the single list behind both the `-v`
+      575: /// debug log and the `calibrate` command's stdout block, so the
+      576: /// two can't drift.
+      577: ///
+      578: /// - The means come first, then one entry per [`DITHER_LOW_Q`]
+      579: ///   discard fraction. The production fit is the `lowq` entry at
+      580: ///   [`DITHER_PROD_Q`].
+      581: pub fn fit_candidates(d_low: &DitherPoint, d_high: &DitherPoint) -> Vec<(String, f64, f64)> {
+      582:     let mut out = vec![
+      583:         ("full".to_string(), d_low.mean_ns, d_high.mean_ns),
+      584:         ("p99".to_string(), d_low.mean_p99_ns, d_high.mean_p99_ns),
+      585:         ("fast".to_string(), d_low.mean_fast_ns, d_high.mean_fast_ns),
+      586:         (
+      587:             "medwin".to_string(),
+      588:             d_low.median_window_ns,
+      589:             d_high.median_window_ns,
+      590:         ),
+      591:     ];
+      592:     for (i, frac) in DITHER_LOW_Q.iter().enumerate() {
+      593:         out.push((
+      594:             format!("lowq{:.1}%", frac * 100.0),
+      595:             d_low.low_q_ns[i],
+      596:             d_high.low_q_ns[i],
+      597:         ));
+      598:     }
+      599:     out
+      600: }
