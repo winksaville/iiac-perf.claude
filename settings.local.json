@@ -76,7 +76,10 @@
       "Bash(timeout 300 ssh -o BatchMode=yes r5-7600x '/tmp/iiac-dbg calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN\"' 2>&1)",
       "Bash(timeout 120 ssh -o BatchMode=yes r5-7600x 'timeout 40 taskset -c 0 bash -c \"while :; do :; done\" >/dev/null 2>&1 & sp=$!; sleep 1; /tmp/iiac-rel calibrate -v 2>&1 | grep -E \"frame_sample:|frame_call:|calibration fit|WARN|impossible\"; kill $sp 2>/dev/null; echo \"--- spinner stopped\"' 2>&1)",
       "Bash(ssh -o ConnectTimeout=5 -o BatchMode=yes 7600x true)",
-      "Bash(ssh 7600x *)"
+      "Bash(ssh 7600x *)",
+      "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=1 SETTLE_QUICK_GAP=0 SETTLE_WAIT_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
+      "Bash(SETTLE_QUICK_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
+      "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=1 SETTLE_WAIT_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)"
     ]
   }
 }
