@@ -80,7 +80,15 @@
       "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=1 SETTLE_QUICK_GAP=0 SETTLE_WAIT_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
       "Bash(SETTLE_QUICK_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
       "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=1 SETTLE_WAIT_GAP=0 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
-      "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=2 cargo test --release --test settle_anomaly -- --ignored --nocapture)"
+      "Bash(SETTLE_PRINT_ONLY=1 SETTLE_N=2 cargo test --release --test settle_anomaly -- --ignored --nocapture)",
+      "Bash(timeout 20 ssh -o BatchMode=yes 7600x 'ls -d ~/data/prgs/rust/iiac-perf 2>/dev/null; which cargo rsync; cargo --version')",
+      "Bash(timeout 20 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && jj log -r @- --no-graph -T \"change_id.short\\(12\\) ++ \\\\\" \\\\\" ++ description.first_line\\(\\)\" && jj st | head -3')",
+      "Bash(timeout 20 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && git log --oneline -3 && git status --short | head -5')",
+      "Bash(timeout 60 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && cat > /tmp/gauge-3.patch && git apply /tmp/gauge-3.patch && git status --short')",
+      "Bash(timeout 600 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && cargo build --release 2>&1 | tail -3 && cargo test 2>&1 | grep -E \"test result|FAILED\"')",
+      "Bash(timeout 400 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && for i in 1 2 3 4 5; do ./target/release/iiac-perf min-now -d 2 2>&1 | grep -E \"^  environment|^  gauge\"; done')",
+      "Bash(timeout 600 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && echo \"--- unpinned ---\" && for i in 1 2 3; do ./target/release/iiac-perf mpsc-2t probe-mpsc-2t -d 2 2>&1 | grep -E \"^  gauge\"; done && echo \"--- pinned 2,3 ---\" && for i in 1 2 3; do ./target/release/iiac-perf mpsc-2t probe-mpsc-2t -d 2 --pin 2,3 2>&1 | grep -E \"^  gauge\"; done')",
+      "Bash(timeout 60 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && git status --short && git apply - && echo \"--- applied ---\" && git status --short && git log --oneline -1')"
     ]
   }
 }
