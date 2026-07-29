@@ -88,7 +88,9 @@
       "Bash(timeout 600 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && cargo build --release 2>&1 | tail -3 && cargo test 2>&1 | grep -E \"test result|FAILED\"')",
       "Bash(timeout 400 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && for i in 1 2 3 4 5; do ./target/release/iiac-perf min-now -d 2 2>&1 | grep -E \"^  environment|^  gauge\"; done')",
       "Bash(timeout 600 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && echo \"--- unpinned ---\" && for i in 1 2 3; do ./target/release/iiac-perf mpsc-2t probe-mpsc-2t -d 2 2>&1 | grep -E \"^  gauge\"; done && echo \"--- pinned 2,3 ---\" && for i in 1 2 3; do ./target/release/iiac-perf mpsc-2t probe-mpsc-2t -d 2 --pin 2,3 2>&1 | grep -E \"^  gauge\"; done')",
-      "Bash(timeout 60 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && git status --short && git apply - && echo \"--- applied ---\" && git status --short && git log --oneline -1')"
+      "Bash(timeout 60 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && git status --short && git apply - && echo \"--- applied ---\" && git status --short && git log --oneline -1')",
+      "Bash(echo \"local:  $\\(rustc -V\\)\")",
+      "Bash(timeout 15 ssh -o BatchMode=yes 7600x 'echo \"7600x:  $\\(rustc -V\\)\"; ls -d ~/data/prgs/rust/iiac-perf 2>/dev/null || echo \"no repo checkout\"')"
     ]
   }
 }

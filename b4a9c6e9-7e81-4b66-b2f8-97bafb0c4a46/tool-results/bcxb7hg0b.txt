@@ -1,0 +1,2054 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 62c9bf6932..3d604674f8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "iiac-perf"
+-version = "0.23.0-6"
++version = "0.23.0-7"
+ edition = "2024"
+ description = "Latency microbenchmark harness for Rust: percentile-band histograms, adaptive loop sizing, per-thread CPU pinning, and calibrated apparatus-overhead subtraction. First benches measure inter-/intra-application communication (IIAC)."
+ 
+diff --git a/src/benches/tp2_pc.rs b/src/benches/tp2_pc.rs
+index 45e2509b56..96f62f1712 100644
+--- a/src/benches/tp2_pc.rs
++++ b/src/benches/tp2_pc.rs
+@@ -7,7 +7,7 @@
+ //! Run back-to-back with [`crate::benches::tp_pc`] to compare
+ //! hot-path cost of the direct-histogram path against the
+ //! scope-API path on the same workload, inside one process so
+-//! calibration and system state are shared.
++//! the tick rate and system state are shared.
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, mpsc};
+diff --git a/src/dither.rs b/src/dither.rs
+new file mode 100644
+index 0000000000..a735e63aac
+--- /dev/null
++++ b/src/dither.rs
+@@ -0,0 +1,78 @@
++//! Sub-quantum phase dither for the sample seam.
++//!
++//! The timer reads integer nanoseconds, so a sample's error depends
++//! on where it happens to land on the clock lattice. Spinning a
++//! random, sub-quantum amount *outside* the timed interval before
++//! each sample re-rolls that phase, which makes the quantization
++//! error zero-mean across a run instead of a coherent bias.
++//!
++//! - [`Dither::spin`] is the seam call: run between samples, never
++//!   inside a measured interval.
++//! - [`Dither::rand_u64`] exposes the raw stream for callers wanting
++//!   coarser randomness, such as the harness's block sleep lengths.
++//!
++//! See notes/design.md#dithering-random-phase-injection for why
++//! random phase beats a fixed offset.
++
++use std::hint::black_box;
++
++/// Dither span in neutral spin iterations (~0.4-0.5 ns each, so
++/// ~26-32 ns, spanning ~3 clock quanta). A random 0..span delay
++/// before each sample randomizes its phase on the ~10 ns clock
++/// lattice, making the quantization error zero-mean.
++pub const DITHER_SPAN: u64 = 64;
++
++/// Xorshift64* PRNG for dither lengths. No external dep; phase
++/// randomization needs rough uniformity, not statistical rigor.
++struct XorShift64(u64);
++
++impl XorShift64 {
++    /// Next pseudo-random u64.
++    fn next(&mut self) -> u64 {
++        let mut x = self.0;
++        x ^= x >> 12;
++        x ^= x << 25;
++        x ^= x >> 27;
++        self.0 = x;
++        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
++    }
++}
++
++/// Sub-quantum phase dither: a random 0..[`DITHER_SPAN`] neutral
++/// spin, run *outside* the timed interval before each sample.
++pub struct Dither(XorShift64);
++
++impl Dither {
++    /// New dither source, seeded from wall-clock nanos (any
++    /// per-invocation variation suffices for phase dither).
++    pub fn new() -> Self {
++        let seed = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.subsec_nanos() as u64 | 1)
++            .unwrap_or(0x9E37_79B9_7F4A_7C15); // OK: fixed fallback seed still dithers
++        Dither(XorShift64(seed))
++    }
++
++    /// Spin a random 0..[`DITHER_SPAN`] iterations to re-roll the
++    /// next sample's phase on the clock lattice.
++    #[inline]
++    pub fn spin(&mut self) {
++        let r = self.0.next() % DITHER_SPAN;
++        for _ in 0..r {
++            black_box(1u64);
++        }
++    }
++
++    /// Next raw pseudo-random u64, for callers needing coarser
++    /// randomness (e.g. the harness's block sleep lengths).
++    pub fn rand_u64(&mut self) -> u64 {
++        self.0.next()
++    }
++}
++
++impl Default for Dither {
++    /// Same as [`Dither::new`].
++    fn default() -> Self {
++        Self::new()
++    }
++}
+diff --git a/src/gauge.rs b/src/gauge.rs
+index 813802f0dc..0065c2ed3b 100644
+--- a/src/gauge.rs
++++ b/src/gauge.rs
+@@ -15,10 +15,9 @@
+ //! environment grade is a true and useful statement: the workload
+ //! is bursty on a quiet machine.
+ //!
+-//! The calibration grade certified a ~1 s window *before* the run
+-//! — the room, not the exam. The run grade scores the exam: every
+-//! signal is computed from the batches the run itself produced,
+-//! so the letter describes the data being reported.
++//! Every signal is computed from the batches the run itself
++//! produced, so the letter describes the data being reported
++//! rather than a window measured beforehand.
+ //!
+ //! - Four signals, each scored against its own ascending cutoffs
+ //!   (A..F); the composite letter is the worst of them, and each
+@@ -26,28 +25,15 @@
+ //!   composite always names its cause. See
+ //!   [`RunGrade::scores`] for the arithmetic and
+ //!   [`thresholds`] for the cutoffs.
+-//! - **Four, where the calibration grade has six.** The mapping,
+-//!   and why two have no run-side analog:
+-//!   - `disturbed` → `interference` — the census rate, same
+-//!     definition rebased on the batch's own floor.
+-//!   - `dirty windows` → `bursts` — window becomes batch.
+-//!   - `drift` → `drift` — floor movement across the
+-//!     measurement, unchanged in spirit.
+-//!   - `repeat` → `step` — `repeat` compares constants between
+-//!     two clean calibration attempts, a transition detector at
+-//!     attempt-to-attempt scale where `drift` is the same
+-//!     detector within one window. A single run has no second
+-//!     attempt, so the equivalent question inside one run is
+-//!     whether the floor shifted partway through: the split
+-//!     detector.
+-//!   - `resid` and `cross` — **no analog, deliberately.** Both
+-//!     grade the quality of a *fit*: the worst residual of a
+-//!     ladder point against the Theil-Sen line, and the
+-//!     loop-only slope against the dithered two-point fit. They
+-//!     exist because calibration fits a line through a multi-N
+-//!     ladder. A bench run fits nothing — no line for a point
+-//!     to sit off, no second estimator to cross-check — so
+-//!     run-side versions would mean inventing the fit first.
++//! - Four, where the startup calibration grade this replaced had
++//!   six. Two of those six graded how well a *fit* held (a
++//!   ladder point's residual against the Theil-Sen line, and the
++//!   loop-only slope against the dithered two-point fit), and a
++//!   bench run fits nothing: no line for a point to sit off, no
++//!   second estimator to cross-check. Inventing a fit just to
++//!   grade it would have been the wrong direction. The full
++//!   mapping is recorded in
++//!   notes/chores/chores-05.md#six-calibration-signals-four-run-signals.
+ //! - Two of the four watch the run's floor move under the
+ //!   measurement: `drift` asks whether the run ended where it
+ //!   began, `step` looks for a shift anywhere inside it and says
+diff --git a/src/harness.rs b/src/harness.rs
+index 30495d262b..9371668b7f 100644
+--- a/src/harness.rs
++++ b/src/harness.rs
+@@ -6,7 +6,7 @@
+ use hdrhistogram::Histogram;
+ 
+ use crate::bands::{self, BandLabels};
+-use crate::overhead::{Dither, Overhead};
++use crate::dither::Dither;
+ 
+ const WARMUP: u64 = 10_000;
+ const ESTIMATE_STEPS: u64 = 1_000;
+@@ -107,9 +107,9 @@
+ const BATCH_FLOOR_Q: f64 = 0.10;
+ 
+ /// Census threshold: a batch sample is "over floor" above
+-/// `max(BATCH_OVER_MULT x floor, floor + BATCH_OVER_ADD_PS)` —
+-/// the calibration disturbed-sample definition, applied per batch
+-/// against the batch's own [`BATCH_FLOOR_Q`] floor.
++/// `max(BATCH_OVER_MULT x floor, floor + BATCH_OVER_ADD_PS)`,
++/// applied per batch against the batch's own [`BATCH_FLOOR_Q`]
++/// floor.
+ ///
+ /// - Measured against the raw min instead, the census was
+ ///   meaningless on any bench with a low tail: mpsc-2t batches
+@@ -128,10 +128,9 @@
+ const BLOCK_SLEEP_MS_MIN: u64 = 1;
+ const BLOCK_SLEEP_MS_MAX: u64 = 10;
+ 
+-/// Unrecorded post-wake warm-up per block (seconds) — each wake
+-/// pays a frequency ramp + cache refill (the measured
+-/// cold-calibration effect), which must not leak into the block's
+-/// samples.
++/// Unrecorded post-wake warm-up per block (seconds). Each wake
++/// pays a frequency ramp plus a cache refill, which must not leak
++/// into the block's samples.
+ const BLOCK_WARMUP_SECONDS: f64 = 0.002;
+ 
+ /// Histogram value bounds: 1 ps to 60 s at 3 sig figs. Values
+@@ -176,16 +175,13 @@
+ /// Runtime configuration for one [`run_adaptive`] call.
+ #[derive(Debug)]
+ pub struct RunCfg<'a> {
+-    /// Calibrated apparatus overhead (framing + loop/iter) used to
+-    /// compute the `adjusted` mean columns in the report.
+-    pub overhead: &'a Overhead,
+     /// Wall-clock seconds budget for time-based runs. Ignored when
+     /// `outer_override` is set.
+     pub target_seconds: f64,
+     /// Force a fixed outer-loop count, bypassing the time budget.
+     pub outer_override: Option<u64>,
+     /// Force a fixed inner-loop count, bypassing the
+-    /// overhead-dominated auto-sizing.
++    /// micro-probe-driven auto-sizing.
+     pub inner_override: Option<u64>,
+     /// Core pool for thread pinning. Indexed positionally with
+     /// wrap-around via [`core_for`][RunCfg::core_for]; empty means
+@@ -641,8 +637,8 @@
+ /// Size `inner` so per-sample apparatus cost is dominated by
+ /// workload: `inner ≈ RATIO * frame / step`.
+ ///
+-/// - `frame_ns` comes from [`micro_probe_frame_ns`] — an
+-///   order-of-magnitude sizing input, not a calibrated
++/// - `frame_ns` comes from [`micro_probe_frame_ns`], an
++///   order-of-magnitude sizing input rather than a measured
+ ///   constant; the ratio and [`MAX_INNER`] clamp absorb its
+ ///   imprecision.
+ fn pick_inner(step_cost_ns: f64, frame_ns: f64) -> u64 {
+@@ -1101,11 +1097,9 @@
+ /// is `pandas.cut`'s `right=True` convention; the rank is the Hazen
+ /// plotting position `(i - 0.5) / n`. Label style comes from
+ /// `cfg.band_labels` and is recorded as `labels=` in the header
+-/// metadata so saved outputs are self-describing. The `adjusted`
+-/// columns subtract per-call apparatus overhead
+-/// (`cfg.overhead.adjust_per_call_ns(inner)` — the amortized loop
+-/// cost plus the dithered in-interval framing slice amortized by
+-/// `inner`); the untrimmed `stdev` is the
++/// metadata so saved outputs are self-describing. Values are raw:
++/// nothing is subtracted, so a column is what the apparatus
++/// measured. The untrimmed `stdev` is the
+ /// hdrhistogram-native stdev, which includes the ms-scale outliers
+ /// in the tail band. Ends with `WARNING` lines flagging poisoned
+ /// stats when they apply — `suspended_s` comes from
+@@ -1117,9 +1111,7 @@
+     let duration_s = out.duration_s;
+     let suspended_s = out.suspended_s;
+     let block_stats = out.block_stats.as_ref();
+-    // Header line: bench name + logfmt-style metadata. `adj` is the
+-    // apparatus overhead subtracted from each sample downstream.
+-    let adj = cfg.overhead.adjust_per_call_ns(inner);
++    // Header line: bench name + logfmt-style metadata.
+     let total = outer * inner;
+     let blocks_meta = match block_stats {
+         Some(b) => format!(" blocks={}", b.blocks),
+@@ -1127,12 +1119,11 @@
+     };
+     let batches_meta = format!(" batches={}", out.batches.len());
+     println!(
+-        "{name} [duration={:.1}s outer={} inner={} calls={} adj/call={}ns{blocks_meta}{batches_meta} labels={}]:",
++        "{name} [duration={:.1}s outer={} inner={} calls={}{blocks_meta}{batches_meta} labels={}]:",
+         duration_s,
+         fmt_commas(outer),
+         inner,
+         fmt_commas(total),
+-        fmt_commas_f64(adj, 2),
+         cfg.band_labels.as_str(),
+     );
+ 
+@@ -1173,7 +1164,7 @@
+     let mean_trim_label = format!("mean {trim_range}");
+     let stdev_trim_label = format!("stdev {trim_range}");
+ 
+-    // Build rendered rows: (label, first, last, range, count, mean, adj_mean).
++    // Build rendered rows: (label, first, last, range, count, mean).
+     struct BandRow {
+         label: String,
+         first: String,
+@@ -1181,7 +1172,6 @@
+         range: String,
+         count: String,
+         mean: String,
+-        adj_mean: String,
+     }
+ 
+     let mut rows: Vec<BandRow> = Vec::new();
+@@ -1190,7 +1180,6 @@
+             continue;
+         }
+         let mean_ns = band_sum[i] as f64 / band_count[i] as f64 / PS_PER_NS;
+-        let adj_mean = (mean_ns - adj).max(0.0);
+         rows.push(BandRow {
+             label: bounds[i + 1].label(cfg.band_labels),
+             first: fmt_commas_f64(band_first[i] as f64 / PS_PER_NS, cfg.decimals),
+@@ -1201,7 +1190,6 @@
+             ),
+             count: fmt_commas(band_count[i]),
+             mean: fmt_commas_f64(mean_ns, cfg.decimals),
+-            adj_mean: fmt_commas_f64(adj_mean, cfg.decimals),
+         });
+     }
+ 
+@@ -1211,16 +1199,13 @@
+     // is often wider than any band mean and would otherwise
+     // overflow its column, shifting its line right.
+     let hist_mean = hist.mean() / PS_PER_NS;
+-    let hist_adj = (hist_mean - adj).max(0.0);
+     let hist_mean_s = fmt_commas_f64(hist_mean, cfg.decimals);
+-    let hist_adj_s = fmt_commas_f64(hist_adj, cfg.decimals);
+     let hist_stdev_s = fmt_commas_f64(hist.stdev() / PS_PER_NS, cfg.decimals);
+ 
+     let trim_count: u64 = band_count[..trim_bands].iter().sum();
+     let trim = if trim_count > 0 {
+         let trim_sum: u128 = band_sum[..trim_bands].iter().sum();
+         let trim_mean = trim_sum as f64 / trim_count as f64 / PS_PER_NS;
+-        let trim_adj = (trim_mean - adj).max(0.0);
+ 
+         // Variance: walk histogram buckets, include only non-tail bands.
+         let mut trim_var_sum = 0.0f64;
+@@ -1246,7 +1231,6 @@
+ 
+         Some((
+             fmt_commas_f64(trim_mean, cfg.decimals),
+-            fmt_commas_f64(trim_adj, cfg.decimals),
+             fmt_commas_f64(trim_stdev, cfg.decimals),
+         ))
+     } else {
+@@ -1263,8 +1247,8 @@
+         )
+     });
+ 
+-    // Column widths from rendered strings — band rows and the
+-    // summary lines that print in the mean/adjusted columns.
++    // Column widths from rendered strings: band rows and the
++    // summary lines that print in the mean column.
+     let label_w = rows
+         .iter()
+         .map(|r| r.label.len())
+@@ -1279,7 +1263,7 @@
+         .iter()
+         .map(|r| r.mean.len())
+         .chain([hist_mean_s.len(), hist_stdev_s.len()])
+-        .chain(trim.iter().flat_map(|(m, _, s)| [m.len(), s.len()]))
++        .chain(trim.iter().flat_map(|(m, s)| [m.len(), s.len()]))
+         .chain(
+             block_strs
+                 .iter()
+@@ -1287,18 +1271,6 @@
+         )
+         .max()
+         .unwrap_or(0);
+-    // The `adjusted` header (8 chars) spans GAP + adj_w + ` ns`
+-    // = 7 + adj_w columns; the floor of 5 keeps 4 spaces between
+-    // the mean and adjusted headers when the adjusted values are
+-    // narrow.
+-    let adj_w = rows
+-        .iter()
+-        .map(|r| r.adj_mean.len())
+-        .chain([hist_adj_s.len()])
+-        .chain(trim.iter().map(|(_, a, _)| a.len()))
+-        .max()
+-        .unwrap_or(0)
+-        .max(5);
+ 
+     const INDENT: &str = "  ";
+     const GAP: &str = "    ";
+@@ -1312,20 +1284,19 @@
+     let range_gap = GAP.len() + range_w + UNIT;
+     let count_gap = GAP.len() + count_w;
+     let mean_gap = GAP.len() + mean_w + UNIT;
+-    let adj_gap = GAP.len() + adj_w + UNIT;
+     println!(
+-        "{:>first_col$}{:>last_gap$}{:>range_gap$}{:>count_gap$}{:>mean_gap$}{:>adj_gap$}",
+-        "first", "last", "range", "count", "mean", "adjusted",
++        "{:>first_col$}{:>last_gap$}{:>range_gap$}{:>count_gap$}{:>mean_gap$}",
++        "first", "last", "range", "count", "mean",
+     );
+ 
+     for r in &rows {
+         println!(
+-            "{INDENT}{:<label_w$} {:>first_w$} ns{GAP}{:>last_w$} ns{GAP}{:>range_w$} ns{GAP}{:>count_w$}{GAP}{:>mean_w$} ns{GAP}{:>adj_w$} ns",
+-            r.label, r.first, r.last, r.range, r.count, r.mean, r.adj_mean,
++            "{INDENT}{:<label_w$} {:>first_w$} ns{GAP}{:>last_w$} ns{GAP}{:>range_w$} ns{GAP}{:>count_w$}{GAP}{:>mean_w$} ns",
++            r.label, r.first, r.last, r.range, r.count, r.mean,
+         );
+     }
+ 
+-    // Whole-histogram summary. Aligned to mean/adjusted columns.
++    // Whole-histogram summary. Aligned to the mean column.
+     let skip = first_w
+         + " ns".len()
+         + GAP.len()
+@@ -1337,7 +1308,7 @@
+         + GAP.len()
+         + count_w;
+     println!(
+-        "{INDENT}{:<label_w$} {:>skip$}{GAP}{hist_mean_s:>mean_w$} ns{GAP}{hist_adj_s:>adj_w$} ns",
++        "{INDENT}{:<label_w$} {:>skip$}{GAP}{hist_mean_s:>mean_w$} ns",
+         "mean", "",
+     );
+     println!(
+@@ -1345,9 +1316,9 @@
+         "stdev", "",
+     );
+ 
+-    if let Some((trim_mean_s, trim_adj_s, trim_stdev_s)) = &trim {
++    if let Some((trim_mean_s, trim_stdev_s)) = &trim {
+         println!(
+-            "{INDENT}{:<label_w$} {:>skip$}{GAP}{trim_mean_s:>mean_w$} ns{GAP}{trim_adj_s:>adj_w$} ns",
++            "{INDENT}{:<label_w$} {:>skip$}{GAP}{trim_mean_s:>mean_w$} ns",
+             mean_trim_label, "",
+         );
+         println!(
+diff --git a/src/main.rs b/src/main.rs
+index 6b6078c123..720da553a9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,10 +2,10 @@
+ mod bands;
+ mod benches;
+ mod config;
++mod dither;
+ mod gauge;
+ mod harness;
+ mod inhibit;
+-mod overhead;
+ mod pin;
+ mod probe;
+ mod qualify;
+@@ -17,8 +17,8 @@
+ use log::{debug, info};
+ 
+ /// One-line name + version banner, shared by clap's `about` and
+-/// every runtime entry (bench runs, the calibrate command, the
+-/// no-benches listing), so the header is identical everywhere.
++/// every runtime entry (bench runs, the no-benches listing), so
++/// the header is identical everywhere.
+ const ABOUT: &str = concat!(
+     "iiac-perf ",
+     env!("CARGO_PKG_VERSION"),
+@@ -36,9 +36,6 @@
+ const COMMANDS_HELP: &str = concat!(
+     "Commands:\n",
+     "  all        run every registered bench\n",
+-    "  calibrate  run calibration only and print the constants plus the raw\n",
+-    "             fit inputs (dithered points, alternative fits, ticks/ns).\n",
+-    "             Must stand alone; --pin, --no-pin-cal, and -v apply as usual.\n",
+     "  qualify-environment\n",
+     "             is this machine fit to measure on? Respawns this binary\n",
+     "             --runs times at --gap, collects each run's environment grade,\n",
+@@ -62,14 +59,12 @@
+ #[derive(Parser)]
+ #[command(version, about = ABOUT, max_term_width = 80, after_help = COMMANDS_HELP)]
+ struct Cli {
+-    /// Benches to run, or a command word ('all', 'calibrate',
++    /// Benches to run, or a command word ('all',
+     /// 'qualify-environment', 'add-completion-yaml').
+     ///
+     /// Pass 'all' for every registered bench, or one or more
+     /// names; a name matching no bench exactly runs every bench
+-    /// it is a prefix of (e.g. 'ice', 'mpsc'). Pass 'calibrate'
+-    /// (alone) to run calibration only and print the constants
+-    /// plus raw fit inputs — no bench runs. Pass
++    /// it is a prefix of (e.g. 'ice', 'mpsc'). Pass
+     /// 'qualify-environment' (alone) to ask whether this machine
+     /// is fit to measure on. Pass
+     /// 'add-completion-yaml' (alone) to write the carapace
+@@ -117,25 +112,24 @@
+     #[arg(long, value_name = "CORES")]
+     pin: Option<String>,
+ 
+-    /// Skip pinning the main thread for calibration.
++    /// Skip pinning the main thread for the TSC tick-rate warm.
+     ///
+-    /// Always takes effect, including when `--pin` is set — bench
++    /// Always takes effect, including when `--pin` is set: bench
+     /// threads still pin per `--pin`, but main stays on whatever
+-    /// affinity mask the process launched with. By default
+-    /// (without this flag), calibration runs with main pinned to
+-    /// `pin[0]` if set, else core 0, so framing/loop come from a
+-    /// stable environment. Pass this flag to decouple the
+-    /// calibration environment from the bench pinning pool (or to
+-    /// reproduce pre-0.6.0 behavior when `--pin` is absent).
++    /// affinity mask the process launched with. By default (without
++    /// this flag), the tick-rate warm runs with main pinned to
++    /// `pin[0]` if set, else core 0. Pass this flag to decouple the
++    /// warm from the bench pinning pool (or to reproduce pre-0.6.0
++    /// behavior when `--pin` is absent).
+     #[arg(long)]
+     no_pin_cal: bool,
+ 
+     /// Enable verbose internals on stderr (like `RUST_LOG=debug`).
+     ///
+-    /// Shows affinity mask, cal parameters and raw fit inputs,
+-    /// calibration wall time. Default is `warn` (silent unless
+-    /// something's wrong). `RUST_LOG` overrides this flag when
+-    /// set, so per-module filtering still works.
++    /// Shows the affinity mask, the pin lifecycle, and the TSC
++    /// tick rate. Default is `warn` (silent unless something's
++    /// wrong). `RUST_LOG` overrides this flag when set, so
++    /// per-module filtering still works.
+     #[arg(short, long)]
+     verbose: bool,
+ 
+@@ -245,7 +239,7 @@
+     /// No bench runs. Machine-readable: the carapace spec's
+     /// exec-macro calls this at completion time for dynamic
+     /// bench-name candidates (see --completions), and scripts can
+-    /// iterate it. The 'all' / 'calibrate' command words are not
++    /// iterate it. The 'all' command word is not
+     /// bench names and are not listed.
+     #[arg(long, conflicts_with = "completions")]
+     list_benches: bool,
+@@ -367,7 +361,6 @@
+         "  positionalany:\n",
+         "  - \"$(iiac-perf --list-benches)\"\n",
+         "  - \"all\\trun every registered bench\"\n",
+-        "  - \"calibrate\\tcalibration only; print constants + raw fit inputs\"\n",
+         "  - \"qualify-environment\\tis this machine fit to measure on?\"\n",
+         "  - \"add-completion-yaml\\twrite the carapace completion spec to the specs dir\"\n",
+     );
+@@ -399,100 +392,11 @@
+     out
+ }
+ 
+-/// Print the `calibrate` command's diagnostic block: raw pass
+-/// outputs (window minima, the loop-only ladder, both dithered
+-/// points), the diagnostic two-point fits, the TSC tick rate, and
+-/// the calibration wall time — the stdout counterpart of the `-v`
+-/// debug logs, for frequency-regime fingerprinting without
+-/// running a bench.
+-fn print_raw_calibration(o: &overhead::Overhead, ticks_per_ns: f64) {
+-    println!("Raw fit inputs:");
+-    println!("  ticks/ns          {ticks_per_ns:.6}");
+-    println!(
+-        "  w_low             {:.3} ns/sample  (min window mean, {}x{} @ N={})",
+-        o.cal_w_low_ns,
+-        overhead::W_LOW_WINDOWS,
+-        overhead::W_LOW_SAMPLES,
+-        overhead::N_LOW,
+-    );
+-    println!(
+-        "  l_low             {:.3} ns/sample  (same, no timer pair; w_low-l_low = frame/call)",
+-        o.cal_l_low_ns,
+-    );
+-    println!("Loop-only ladder (Theil-Sen slope is the production loop/iter):");
+-    for &(n, per_sample) in &o.cal_loop_ladder {
+-        println!(
+-            "  N={n:<6} {per_sample:>12.3} ns/sample  ({:.6} ns/iter, {}x{} windows)",
+-            per_sample / n as f64,
+-            overhead::W_LOW_WINDOWS,
+-            overhead::loop_samples(n),
+-        );
+-    }
+-    println!("  slope             {:.6} ns/iter", o.loop_per_iter_ns,);
+-    println!();
+-    for (name, n, p) in [
+-        ("d_low ", overhead::N_LOW, &o.cal_d_low),
+-        ("d_high", overhead::N_HIGH, &o.cal_d_high),
+-    ] {
+-        println!(
+-            "  {name} @ N={n:<6} mean {:.3} | p99mean {:.3} | fast {:.3} | medwin {:.3} | spread {:.3} | min {} ns",
+-            p.mean_ns,
+-            p.mean_p99_ns,
+-            p.mean_fast_ns,
+-            p.median_window_ns,
+-            p.window_spread_ns,
+-            p.min_ns,
+-        );
+-    }
+-    println!();
+-    println!(
+-        "Diagnostic two-point fits (cross-check reads lowq{:.1}%; \
+-         none is the production fit):",
+-        overhead::DITHER_LOW_Q[overhead::DITHER_PROD_Q] * 100.0
+-    );
+-    for (kind, low, high) in overhead::fit_candidates(&o.cal_d_low, &o.cal_d_high) {
+-        let (intercept, loop_per_iter) = overhead::two_point_fit(low, high);
+-        println!("  {kind:<8}  intercept {intercept:.4} ns, loop/iter {loop_per_iter:.6} ns");
+-    }
+-    println!();
+-    println!("Self-checks (graded, worst signal is the environment letter):");
+-    println!(
+-        "  drift bracket     l_start {:.3} -> l_end {:.3} ns/sample ({:.2}%)",
+-        o.cal_l_start_ns,
+-        o.cal_l_end_ns,
+-        o.grade.drift_frac * 100.0,
+-    );
+-    println!(
+-        "  linearity resid   {:.2}% max | slope cross {:.2}%",
+-        o.grade.max_resid_frac * 100.0,
+-        o.grade.slope_cross_frac * 100.0,
+-    );
+-    println!(
+-        "  disturbed         d_low {:.2}% | d_high {:.2}%  (samples > max({:.1}x, +{:.0} ns) \
+-         over low-q floor)",
+-        o.cal_d_low.disturbed_frac * 100.0,
+-        o.cal_d_high.disturbed_frac * 100.0,
+-        overhead::DISTURBED_MULT,
+-        overhead::DISTURBED_ABS_NS,
+-    );
+-    println!(
+-        "  dirty windows     d_low {:.0}% | d_high {:.0}%  (window means > {:.0}% over min)",
+-        o.cal_d_low.dirty_window_frac * 100.0,
+-        o.cal_d_high.dirty_window_frac * 100.0,
+-        overhead::DIRTY_WINDOW_TOL * 100.0,
+-    );
+-    println!();
+-    println!(
+-        "  cal wall time     {:.2} ms",
+-        o.cal_duration.as_secs_f64() * 1000.0
+-    );
+-}
+-
+ fn main() {
+     let cli = Cli::parse();
+ 
+     // Completion generation and the bench-name listing are pure
+-    // print-and-exit paths: no logging, no config, no calibration.
++    // print-and-exit paths: no logging, no config, no setup.
+     if let Some(shell) = cli.completions {
+         print_completions(shell);
+         return;
+@@ -504,7 +408,7 @@
+         return;
+     }
+ 
+-    // 'add-completion-yaml' is a command word like 'calibrate':
++    // 'add-completion-yaml' is a command word like 'all':
+     // self-install the carapace spec, print the path, and exit.
+     if cli.benches.iter().any(|b| b == "add-completion-yaml") {
+         if cli.benches.len() > 1 {
+@@ -583,15 +487,6 @@
+         std::process::exit(code);
+     }
+ 
+-    // 'calibrate' is a command, not a bench: calibration + the
+-    // diagnostic block below, no bench run. It stands alone so a
+-    // typo'd mix doesn't half-run something.
+-    let calibrate_cmd = cli.benches.iter().any(|b| b == "calibrate");
+-    if calibrate_cmd && cli.benches.len() > 1 {
+-        eprintln!("error: 'calibrate' runs alone; drop the other bench args");
+-        std::process::exit(2);
+-    }
+-
+     // Re-exec under systemd-inhibit (unless --no-inhibit or
+     // already inhibited) before any output, so the banner prints
+     // once, from the inhibited child.
+@@ -626,15 +521,14 @@
+         },
+     };
+ 
+-    // Pin main for calibration. Always pinned by default so
+-    // framing/loop numbers come from a stable environment
+-    // regardless of --pin. --no-pin-cal restores pre-0.6.0
+-    // behavior (pin iff --pin given).
++    // Pin main for the TSC tick-rate warm. Always pinned by
++    // default, regardless of --pin; --no-pin-cal restores
++    // pre-0.6.0 behavior (pin iff --pin given).
+     //
+-    // When we're doing the cal-only pin (--pin absent, --no-pin-cal
+-    // absent), snapshot the pre-cal affinity and restore it after
+-    // calibrate() so the scheduler regains freedom to co-locate
+-    // bench threads — otherwise main's pin leaks into the
++    // When we're doing the warm-only pin (--pin absent,
++    // --no-pin-cal absent), snapshot the pre-warm affinity and
++    // restore it afterwards so the scheduler regains freedom to
++    // co-locate bench threads. Otherwise main's pin leaks into the
+     // scheduler's placement decisions and suppresses the
+     // "both ends hot and spinning" fast path.
+     let cal_pin: Option<usize> = if cli.no_pin_cal {
+@@ -642,11 +536,11 @@
+     } else {
+         pin_cores.first().copied().or(Some(0))
+     };
+-    // Save/restore pre-cal affinity whenever we're about to set a
+-    // cal pin that wasn't the user's explicit bench-pin request —
+-    // i.e. the cal-only pin (--pin absent, --no-pin-cal absent).
++    // Save/restore pre-warm affinity whenever we're about to set a
++    // warm pin that wasn't the user's explicit bench-pin request,
++    // i.e. the warm-only pin (--pin absent, --no-pin-cal absent).
+     // --pin ⇒ user already wants main on pin[0]; leave alone.
+-    // --no-pin-cal ⇒ we aren't pinning at all; nothing to save.
++    // --no-pin-cal means we aren't pinning at all; nothing to save.
+     let saved_affinity = if pin_cores.is_empty() && !cli.no_pin_cal {
+         pin::save_affinity()
+     } else {
+@@ -655,129 +549,39 @@
+     pin::pin_current(cal_pin);
+ 
+     if let Some(cpu) = cal_pin {
+-        info!("pinned main to core {cpu} for calibration");
++        info!("pinned main to core {cpu} for the tick-rate warm");
+     } else {
+-        info!("cal pin skipped");
++        info!("warm pin skipped");
+     }
+     if let Some(mask) = pin::current_affinity() {
+-        debug!("affinity during cal: {}", pin::affinity_summary(&mask));
++        debug!("affinity during warm: {}", pin::affinity_summary(&mask));
+     }
+ 
+-    info!(
+-        "calibration params: warmup={}, dither N_LOW={} ({}x{}), \
+-         N_HIGH={} ({}x{}), fast={}, span={}, w_low {}x{}, \
+-         loop ladder {:?} ({} iters/window)",
+-        overhead::CAL_WARMUP,
+-        overhead::N_LOW,
+-        overhead::W_LOW_WINDOWS,
+-        overhead::W_LOW_SAMPLES,
+-        overhead::N_HIGH,
+-        overhead::DITHER_WINDOWS,
+-        overhead::DITHER_HIGH_SAMPLES,
+-        overhead::DITHER_FAST_WINDOWS,
+-        overhead::DITHER_SPAN,
+-        overhead::W_LOW_WINDOWS,
+-        overhead::W_LOW_SAMPLES,
+-        overhead::LOOP_LADDER,
+-        overhead::LOOP_WINDOW_ITERS,
+-    );
+-
+-    let overhead = overhead::calibrate();
+-
+     // Warm the one-time TSC tick-rate calibration (a ~10 ms spin
+     // behind a OnceLock) here on the pinned main thread. Without
+     // this the first TProbe::new in a bench thread pays it inside
+-    // the measurement window — a short -d (e.g. 0.01) was consumed
+-    // entirely by calibration and recorded zero samples.
++    // the measurement window: a short -d (e.g. 0.01) was consumed
++    // entirely by that spin and recorded zero samples.
+     let ticks_per_ns = ticks::ticks_per_ns();
+     debug!("ticks_per_ns: {ticks_per_ns:.6}");
+ 
+-    debug!(
+-        "calibration raw: w_low={:.4} ns, l_low={:.4} ns, d_low_q={:.4} ns, \
+-         d_high_q={:.4} ns",
+-        overhead.cal_w_low_ns,
+-        overhead.cal_l_low_ns,
+-        overhead.cal_d_low.low_q_ns[overhead::DITHER_PROD_Q],
+-        overhead.cal_d_high.low_q_ns[overhead::DITHER_PROD_Q],
+-    );
+-    debug!(
+-        "calibration fit: frame_call={:.4} ns, frame_sample={:.4} ns, loop_per_iter={:.4} ns",
+-        overhead.frame_call_ns, overhead.frame_sample_ns, overhead.loop_per_iter_ns,
+-    );
+-    info!(
+-        "calibration wall time: {:.2} ms",
+-        overhead.cal_duration.as_secs_f64() * 1000.0
+-    );
+-
+     if let Some(set) = saved_affinity.as_ref() {
+         pin::restore_affinity(set);
+     }
+ 
+-    let cal_pin_display = match (pin_cores.first(), cli.no_pin_cal) {
++    let warm_pin_display = match (pin_cores.first(), cli.no_pin_cal) {
+         (_, true) => "none (--no-pin-cal)".to_string(),
+         (Some(c), false) => format!("core {c} (from --pin)"),
+-        (None, false) => "core 0 (unpinned after cal; --no-pin-cal to skip)".to_string(),
+-    };
+-    println!("Calibration:");
+-    println!(
+-        "  frame/call        {:>7} ns  (per sample, call-to-call; sizes inner, not subtracted)",
+-        harness::fmt_commas_f64(overhead.frame_call_ns, 3)
+-    );
+-    println!(
+-        "  frame/sample      {:>7} ns  (per sample, in-interval; subtracted, /inner per call)",
+-        harness::fmt_commas_f64(overhead.frame_sample_ns, 3)
+-    );
+-    println!(
+-        "  loop/iter         {:>7} ns  (per call; subtracted as-is)",
+-        harness::fmt_commas_f64(overhead.loop_per_iter_ns, 3)
+-    );
+-    let repeat_display = match overhead.grade.repeat_ns {
+-        Some(ns) => format!("repeat \u{b1}{ns:.2} ns"),
+-        None => "repeat n/a".to_string(),
+-    };
+-    let [sl_dist, sl_dirty, sl_drift, sl_resid, sl_cross, sl_repeat] =
+-        overhead.grade.signal_letters();
+-    println!(
+-        "  environment       {}  (disturbed {:.2}% {}, dirty win {:.0}% {}, drift {:.2}% {}, \
+-         resid {:.2}% {}, cross {:.2}% {}, {} {})",
+-        overhead.grade.letter,
+-        overhead.grade.disturbed_frac * 100.0,
+-        sl_dist,
+-        overhead.grade.dirty_window_frac * 100.0,
+-        sl_dirty,
+-        overhead.grade.drift_frac * 100.0,
+-        sl_drift,
+-        overhead.grade.max_resid_frac * 100.0,
+-        sl_resid,
+-        overhead.grade.slope_cross_frac * 100.0,
+-        sl_cross,
+-        repeat_display,
+-        sl_repeat,
+-    );
+-    for w in &overhead.warnings {
+-        println!("  WARNING           {w}");
+-    }
+-    for v in &overhead.violations {
+-        println!("  WARNING           calibration is not physically consistent: {v}");
+-    }
+-    if !overhead.violations.is_empty() {
+-        println!(
+-            "  WARNING           {} attempts all failed; treat the constants above as \
+-             unmeasured, not as values",
+-            overhead::CAL_MAX_ATTEMPTS,
+-        );
+-    }
+-    println!("  cal pin           {cal_pin_display}");
++        (None, false) => "core 0 (unpinned after warm; --no-pin-cal to skip)".to_string(),
++    };
++    println!("Setup:");
++    println!("  ticks/ns          {ticks_per_ns:.6}");
++    println!("  warm pin          {warm_pin_display}");
+     println!("  bench pin         {}", pin::plan_summary(&pin_cores));
+     println!("  sleep inhibit     {inhibit_status}");
+     println!("  config            {}", config_summary(&config_files));
+     println!();
+ 
+-    if calibrate_cmd {
+-        print_raw_calibration(&overhead, ticks_per_ns);
+-        return;
+-    }
+-
+     let runners = match benches::resolve(&cli.benches) {
+         Ok(r) => r,
+         Err(e) => {
+@@ -795,7 +599,6 @@
+     };
+ 
+     let cfg = harness::RunCfg {
+-        overhead: &overhead,
+         target_seconds,
+         outer_override: cli.outer,
+         inner_override: cli.inner,
+diff --git a/src/overhead.rs b/src/overhead.rs
+deleted file mode 100644
+index 80d71bc529..0000000000
+--- a/src/overhead.rs
++++ /dev/null
+@@ -1,1151 +0,0 @@
+-//! Apparatus-overhead calibration, paired and amortized.
+-//!
+-//! Three constants, all from paired window passes over one
+-//! shared [`run_inner`]:
+-//!
+-//! - **Loop-only ladder** ([`LOOP_LADDER`], min over amortized
+-//!   window means at each N, samples-per-window scaled so window
+-//!   duration stays constant): the Theil-Sen slope across the
+-//!   points is `loop_per_iter_ns`, subtracted per call.
+-//! - **Window pass minus the ladder's `N_LOW` point** (identical
+-//!   but for the per-sample timer pair) is `frame_call_ns`, the
+-//!   full call-to-call cost of taking a sample — sizes the
+-//!   experiment, never subtracted (most of it sits outside
+-//!   recorded intervals).
+-//! - **Dither `N_LOW` window minimum minus the same point**
+-//!   gives `frame_sample_ns`, the in-interval timer-pair slice a
+-//!   recorded sample actually contains, subtracted per sample.
+-//!
+-//! One shared compiled loop makes the loop term cancel exactly
+-//! in both differences, and pairing (never extrapolating) keeps
+-//! any one contaminated point from levering a constant negative.
+-//!
+-//! The slope needs neither dither nor quantiles: a loop-only
+-//! window has no per-sample timer reads, so the ~10 ns clock
+-//! quantum lands once per window (not once per sample) and the
+-//! per-iteration quantization error is ~0.0001 ns as measured.
+-//! The dithered two-point fit that used to produce the slope is
+-//! retained as a diagnostic only — its divergence from the
+-//! loop-only slope checks the one assumption the pairing leans
+-//! on (that the loop costs the same with and without timer pairs
+-//! interleaved). See
+-//! notes/chores/chores-04.md#replanning-slope-dither-and-self-checks.
+-//!
+-//! Dither makes the ~10 ns clock quantum a zero-mean error that
+-//! averages away in means (validated on r5-7600x: `frame_sample`
+-//! 8.23 / 8.25 / 8.29 ns, a 0.062 ns spread, within a frequency
+-//! regime); its one production consumer is the window *means*
+-//! behind `frame_sample_ns`. See
+-//! notes/design.md#dithering-random-phase-injection,
+-//! notes/design.md#timer-overhead-in-interval-vs-call-to-call and
+-//! notes/chores/chores-04.md#one-sided-contamination-and-the-two-point-fit.
+-//!
+-//! Every calibration also self-checks and grades its
+-//! environment ([`CalGrade`]): physical invariants drive
+-//! retries, statistical signals (interference census, drift
+-//! bracket, linearity, slope cross-check, repeatability across
+-//! two clean attempts) feed an always-printed letter grade,
+-//! with plain-language warnings only at D or worse. The user is
+-//! never assumed to know the diagnostics exist.
+-
+-use std::hint::black_box;
+-use std::time::{Duration, Instant};
+-
+-use crate::harness::Bench;
+-
+-/// Calibration warmup iterations — long enough for CPU frequency
+-/// boost to ramp before the first measurement.
+-pub const CAL_WARMUP: u64 = 100_000;
+-
+-/// Attempts before a physically impossible calibration is
+-/// reported rather than retried. Interference is transient, so a
+-/// retry usually lands on a quieter moment; a persistent
+-/// violation is a real problem the user needs to see.
+-pub const CAL_MAX_ATTEMPTS: u32 = 3;
+-
+-/// Clean (violation-free) attempts calibration collects before
+-/// publishing — the second exists to *measure repeatability*,
+-/// the environment grade's headline number: two attempts that
+-/// disagree mean the constants don't transfer to the bench run
+-/// that follows, whatever each attempt's internal statistics
+-/// say. The published constants come from the last clean
+-/// attempt (the most warmed-up machine state).
+-pub const CAL_CLEAN_ATTEMPTS: usize = 2;
+-
+-/// Inner-loop count for the low-N calibration point.
+-pub const N_LOW: u64 = 100;
+-
+-/// Inner-loop count for the high-N calibration point. A wide spread
+-/// (`N_HIGH / (N_HIGH - N_LOW) ≈ 1.01`) keeps noise amplification on
+-/// the fitted intercept small.
+-pub const N_HIGH: u64 = 10_000;
+-
+-/// Inner-loop counts for the loop-only slope ladder, geometric
+-/// from [`N_LOW`] to [`N_HIGH`].
+-///
+-/// - The slope needs the extremes; the interior points exist so
+-///   a violated model is *visible* — two points always fit a
+-///   line perfectly, however corrupted. Their residuals feed the
+-///   linearity self-check.
+-/// - Theil-Sen across all pairs (see [`theil_sen_slope`]) keeps
+-///   one contaminated point from steering the production slope.
+-pub const LOOP_LADDER: [u64; 5] = [100, 300, 1_000, 3_000, 10_000];
+-const _: () = assert!(LOOP_LADDER[0] == N_LOW);
+-const _: () = assert!(LOOP_LADDER[LOOP_LADDER.len() - 1] == N_HIGH);
+-
+-/// Iterations per window in a loop-only ladder pass:
+-/// [`loop_samples`] scales samples-per-window as ~1/N against
+-/// this budget, holding window *duration* roughly constant — the
+-/// property that lets min-over-windows find windows that slip
+-/// between preemptions at every N, and that keeps the ladder's
+-/// points comparable to the [`N_LOW`] passes they pair with.
+-pub const LOOP_WINDOW_ITERS: u64 = N_LOW * W_LOW_SAMPLES;
+-
+-/// Samples per window for a loop-only ladder pass at inner-loop
+-/// count `n`, from the [`LOOP_WINDOW_ITERS`] budget.
+-///
+-/// - At small `samples` the window's own framing (one timer pair
+-///   per window) amortizes over fewer samples; at the N_HIGH
+-///   point that is ~2 ns against a ~5,000 ns sample, ~0.0003
+-///   ns/iter on the slope — accepted, not corrected.
+-pub fn loop_samples(n: u64) -> u64 {
+-    (LOOP_WINDOW_ITERS / n).max(1)
+-}
+-
+-/// Samples per window in the call-to-call and loop-only passes at
+-/// [`N_LOW`]. The window's ±1-quantum error divides by this:
+-/// ~0.01 ns at a ~10 ns quantum.
+-///
+-/// - Lowered from 10,000 with the window count raised to match,
+-///   leaving the total budget unchanged. Window *duration* is
+-///   what decides whether min-over-windows can find a clean
+-///   window: at 10,000 samples an unoptimized build ran ~7.9 ms
+-///   per window, so under a continuous competitor every window
+-///   was contaminated and `l_low` came out *above* the interval
+-///   containing it. Shorter windows fit between preemptions.
+-/// - The two passes are differenced, so their windows must be
+-///   comparable in duration or the difference is meaningless.
+-pub const W_LOW_SAMPLES: u64 = 1_000;
+-
+-/// Windows in the call-to-call and loop-only passes; the minimum
+-/// is kept. The min sheds windows inflated by preemption or a
+-/// frequency dip while staying amortized (each candidate is
+-/// already a window mean).
+-pub const W_LOW_WINDOWS: u64 = 1_000;
+-
+-/// Dither span in neutral spin iterations (~0.4-0.5 ns each →
+-/// ~26-32 ns, spanning ~3 clock quanta). A random 0..span delay
+-/// before each sample randomizes its phase on the ~10 ns clock
+-/// lattice, making the quantization error zero-mean (see
+-/// notes/design.md#dithering-random-phase-injection).
+-pub const DITHER_SPAN: u64 = 64;
+-
+-/// Windows in the dithered [`N_HIGH`] pass (each yields one
+-/// window mean; the spread across windows is the dispersion
+-/// signal). The dithered [`N_LOW`] pass instead uses the
+-/// [`W_LOW_WINDOWS`] x [`W_LOW_SAMPLES`] shape: its
+-/// `min_window_ns` is differenced against the loop-only pass
+-/// for `frame_sample`, and differenced passes need identical
+-/// window shapes or their order statistics aren't comparable
+-/// (the d_low/l_low shape mismatch measurably destabilized
+-/// `min_window_ns` by ~8% between attempts).
+-pub const DITHER_WINDOWS: u64 = 40;
+-
+-/// Dithered-fit samples per window at [`N_HIGH`] (samples are
+-/// ~100× longer than at [`N_LOW`], so few keep the wall cost
+-/// bounded).
+-pub const DITHER_HIGH_SAMPLES: u64 = 250;
+-
+-/// Fastest window means averaged for the `fast` diagnostic.
+-///
+-/// - **Not** the production estimator: window-level tail
+-///   selection assumes interference is sporadic enough that some
+-///   window escapes it. Under a continuous competitor no
+-///   `N_HIGH` window does (measured: fastest window 142,644 ns
+-///   against a 76,573 ns sample floor), so this reads as
+-///   contaminated as the means. Kept as a logged comparison
+-///   because its *divergence* from the sample quantiles is a
+-///   contamination signal. See
+-///   notes/chores/chores-04.md#one-sided-contamination-and-the-two-point-fit.
+-pub const DITHER_FAST_WINDOWS: u64 = 4;
+-
+-/// Candidate discard fractions for the low-quantile estimator:
+-/// drop this fraction of the fastest samples, then take the
+-/// minimum of what remains (so `0.0` is the strict minimum).
+-///
+-/// - Scheduler interference is one-sided, so the *low* tail is
+-///   the uncontaminated part of the distribution — but its very
+-///   bottom is where samples that rounded down on the ~10 ns
+-///   clock lattice collect. Discarding a slice sheds those
+-///   without giving up the robustness.
+-/// - The aim is a *stable* estimate, not an unbiased one: a
+-///   small repeatable bias is subtracted consistently, whereas
+-///   contamination is neither small nor repeatable.
+-pub const DITHER_LOW_Q: [f64; 4] = [0.0, 0.001, 0.01, 0.05];
+-
+-/// Index into [`DITHER_LOW_Q`] selecting the discard fraction
+-/// the diagnostic two-point fit reads (see the module doc — the
+-/// production slope is the loop-only Theil-Sen; this fit is the
+-/// cross-check on the with/without-timer-pairs assumption).
+-pub const DITHER_PROD_Q: usize = 2;
+-
+-/// A sample is "disturbed" when it exceeds the low-quantile
+-/// floor by this multiple *and* by [`DISTURBED_ABS_NS`] — the
+-/// calibration passes double as a census of scheduler
+-/// interference, and `max(floor x mult, floor + abs)` is the
+-/// census line. Interference is one-sided, so everything sits
+-/// between the floor and the spikes.
+-pub const DISTURBED_MULT: f64 = 1.5;
+-
+-/// Absolute part of the disturbed-sample bound, in ns. The
+-/// multiplicative part alone breaks down when the floor is only
+-/// a few clock quanta: at a 60 ns d_low floor, 1.5x lands at
+-/// 90 ns — *inside* the legitimate lattice+dither range (~10 ns
+-/// quantum), and read 6.3% "disturbed" on a quiet machine.
+-/// ~5 quanta clears the lattice spread at short samples while
+-/// staying far below any preemption; at long samples the
+-/// multiplicative part dominates anyway.
+-pub const DISTURBED_ABS_NS: f64 = 50.0;
+-
+-/// A window is "dirty" when its mean exceeds the minimum window
+-/// mean by this fraction — it contained interference the
+-/// min-over-windows estimator had to shed. The *fraction* of
+-/// dirty windows measures how hard clean windows were to find.
+-pub const DIRTY_WINDOW_TOL: f64 = 0.05;
+-
+-/// Environment-grade thresholds, one array per signal: the
+-/// ascending cutoffs a signal crosses to score B, C, D, F (below
+-/// the first is A). The overall letter is the worst signal.
+-///
+-/// - **Provisional** — seeded from quiet-3900X spread on
+-///   2026-07-25; the -5 validation pass on both boxes is meant
+-///   to tune them. The design constraint: a quiet release-build
+-///   machine should essentially never leave A/B, because a
+-///   false alarm every third run destroys trust in the warning.
+-/// - WARNINGs print only at D or worse; C is visible in the
+-///   always-printed grade line without shouting. First
+-///   measurements: a quiet 3900X graded B (debug included), a
+-///   restless one C, and a cross-attempt frequency-regime shift
+-///   D with its warning — the intended spread.
+-pub mod grade_thresholds {
+-    /// Disturbed-sample fraction (worst of d_low / d_high).
+-    pub const DISTURBED: [f64; 4] = [0.005, 0.02, 0.05, 0.15];
+-    /// Dirty-window fraction (worst of d_low / d_high).
+-    pub const DIRTY_WINDOWS: [f64; 4] = [0.25, 0.50, 0.75, 0.90];
+-    /// Loop-only floor drift across the calibration bracket.
+-    pub const DRIFT: [f64; 4] = [0.01, 0.02, 0.05, 0.10];
+-    /// Worst relative residual of a ladder point vs the line.
+-    pub const RESID: [f64; 4] = [0.01, 0.02, 0.05, 0.10];
+-    /// Loop-only vs dithered-fit slope divergence.
+-    pub const CROSS: [f64; 4] = [0.02, 0.05, 0.10, 0.20];
+-    /// Worst relative constant change between clean attempts.
+-    pub const REPEAT: [f64; 4] = [0.025, 0.05, 0.10, 0.20];
+-}
+-
+-/// Score one signal against its [`grade_thresholds`] array:
+-/// 0 (A) through 4 (F) — the count of cutoffs crossed.
+-fn grade_score(x: f64, cutoffs: [f64; 4]) -> u8 {
+-    cutoffs.iter().filter(|&&c| x > c).count() as u8
+-}
+-
+-/// The environment grade: the always-printed synthesis of the
+-/// calibration self-checks. Signals are facts about the run;
+-/// `letter` is the worst signal's grade ('F' outright when the
+-/// published attempt carries physical violations).
+-///
+-/// - See notes/chores/chores-04.md#replanning-slope-dither-and-self-checks
+-///   for the design: every check runs every time, a passing
+-///   check is silent, and the one always-visible line carries
+-///   the letter plus the evidence behind it.
+-#[derive(Debug)]
+-pub struct CalGrade {
+-    /// Fraction of dithered samples above [`DISTURBED_MULT`] x
+-    /// the low-quantile floor (worst of the two points).
+-    pub disturbed_frac: f64,
+-    /// Fraction of dithered windows above [`DIRTY_WINDOW_TOL`]
+-    /// over the minimum window mean (worst of the two points).
+-    pub dirty_window_frac: f64,
+-    /// `|l_end - l_start| / l_start` over the loop-only bracket
+-    /// passes — machine-state drift across the calibration.
+-    pub drift_frac: f64,
+-    /// Worst `|residual| / value` of a ladder point against the
+-    /// Theil-Sen line (median-intercept anchored).
+-    pub max_resid_frac: f64,
+-    /// `|fit_slope - slope| / slope`, dithered two-point fit vs
+-    /// the production loop-only slope.
+-    pub slope_cross_frac: f64,
+-    /// Worst relative constant change between the last two clean
+-    /// attempts; `None` when fewer than two attempts came out
+-    /// clean (scored as C at best).
+-    pub repeat_rel: Option<f64>,
+-    /// Largest absolute change of frame/call or frame/sample
+-    /// between the last two clean attempts, in ns — the headline
+-    /// "constants repeat to ±X ns" number.
+-    pub repeat_ns: Option<f64>,
+-    /// Overall letter, worst signal wins: A, B, C, D, or F.
+-    pub letter: char,
+-}
+-
+-impl CalGrade {
+-    /// Letters for the environment line's printed signals, in
+-    /// print order: disturbed, dirty windows, drift, resid,
+-    /// cross, repeat — all six composite inputs, so the worst
+-    /// letter on the line *is* the composite and every grade is
+-    /// self-explaining (unknown repeat floors at C).
+-    pub fn signal_letters(&self) -> [char; 6] {
+-        let repeat_score = match self.repeat_rel {
+-            Some(r) => grade_score(r, grade_thresholds::REPEAT),
+-            None => 2,
+-        };
+-        [
+-            score_letter(grade_score(
+-                self.disturbed_frac,
+-                grade_thresholds::DISTURBED,
+-            )),
+-            score_letter(grade_score(
+-                self.dirty_window_frac,
+-                grade_thresholds::DIRTY_WINDOWS,
+-            )),
+-            score_letter(grade_score(self.drift_frac, grade_thresholds::DRIFT)),
+-            score_letter(grade_score(self.max_resid_frac, grade_thresholds::RESID)),
+-            score_letter(grade_score(self.slope_cross_frac, grade_thresholds::CROSS)),
+-            score_letter(repeat_score),
+-        ]
+-    }
+-
+-    /// Worst per-signal score (0=A .. 4=F), with an unknown
+-    /// repeatability floored at C — if two clean attempts never
+-    /// happened, the environment has already said something.
+-    fn score(&self) -> u8 {
+-        let repeat_score = match self.repeat_rel {
+-            Some(r) => grade_score(r, grade_thresholds::REPEAT),
+-            None => 2,
+-        };
+-        [
+-            grade_score(self.disturbed_frac, grade_thresholds::DISTURBED),
+-            grade_score(self.dirty_window_frac, grade_thresholds::DIRTY_WINDOWS),
+-            grade_score(self.drift_frac, grade_thresholds::DRIFT),
+-            grade_score(self.max_resid_frac, grade_thresholds::RESID),
+-            grade_score(self.slope_cross_frac, grade_thresholds::CROSS),
+-            repeat_score,
+-        ]
+-        .into_iter()
+-        .fold(0, u8::max)
+-    }
+-}
+-
+-/// Map a 0..=4 score to its letter (no 'E': 4 is 'F').
+-fn score_letter(score: u8) -> char {
+-    match score {
+-        0 => 'A',
+-        1 => 'B',
+-        2 => 'C',
+-        3 => 'D',
+-        _ => 'F',
+-    }
+-}
+-
+-/// Xorshift64* PRNG for dither lengths. No external dep; phase
+-/// randomization needs rough uniformity, not statistical rigor.
+-struct XorShift64(u64);
+-
+-impl XorShift64 {
+-    /// Next pseudo-random u64.
+-    fn next(&mut self) -> u64 {
+-        let mut x = self.0;
+-        x ^= x >> 12;
+-        x ^= x << 25;
+-        x ^= x >> 27;
+-        self.0 = x;
+-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+-    }
+-}
+-
+-/// Sub-quantum phase dither: a random 0..[`DITHER_SPAN`] neutral
+-/// spin, run *outside* the timed interval before each sample.
+-/// Used by calibration and by the harness sample seam.
+-pub struct Dither(XorShift64);
+-
+-impl Dither {
+-    /// New dither source, seeded from wall-clock nanos (any
+-    /// per-invocation variation suffices for phase dither).
+-    pub fn new() -> Self {
+-        let seed = std::time::SystemTime::now()
+-            .duration_since(std::time::UNIX_EPOCH)
+-            .map(|d| d.subsec_nanos() as u64 | 1)
+-            .unwrap_or(0x9E37_79B9_7F4A_7C15); // OK: fixed fallback seed still dithers
+-        Dither(XorShift64(seed))
+-    }
+-
+-    /// Spin a random 0..[`DITHER_SPAN`] iterations to re-roll the
+-    /// next sample's phase on the clock lattice.
+-    #[inline]
+-    pub fn spin(&mut self) {
+-        let r = self.0.next() % DITHER_SPAN;
+-        for _ in 0..r {
+-            black_box(1u64);
+-        }
+-    }
+-
+-    /// Next raw pseudo-random u64, for callers needing coarser
+-    /// randomness (e.g. the harness's block sleep lengths).
+-    pub fn rand_u64(&mut self) -> u64 {
+-        self.0.next()
+-    }
+-}
+-
+-impl Default for Dither {
+-    /// Same as [`Dither::new`].
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+-
+-/// Aggregates of one dithered measurement point (all ns):
+-/// linear statistics that keep the dither win, plus min for
+-/// reference against the lattice floor.
+-#[derive(Debug)]
+-pub struct DitherPoint {
+-    /// Full mean over all samples — unbiased under dither but
+-    /// absorbs interrupt spikes.
+-    pub mean_ns: f64,
+-    /// Mean of samples ≤ p99 — sheds the top 1% of samples.
+-    /// Retained for comparison and regime fingerprinting; too
+-    /// little trim to survive contention, so no longer the fit
+-    /// input.
+-    pub mean_p99_ns: f64,
+-    /// Mean of the fastest [`DITHER_FAST_WINDOWS`] window means.
+-    /// A diagnostic, not the fit input — see
+-    /// [`DITHER_FAST_WINDOWS`].
+-    pub mean_fast_ns: f64,
+-    /// Low quantiles, one per [`DITHER_LOW_Q`] entry: the
+-    /// smallest sample remaining after discarding that fraction
+-    /// of the fastest. Index into it with the same position.
+-    pub low_q_ns: [f64; DITHER_LOW_Q.len()],
+-    /// Minimum window mean — the amortized in-interval cost per
+-    /// sample, least-disturbed window. Pairs with the loop-only
+-    /// pass to derive `frame_sample` without extrapolating.
+-    pub min_window_ns: f64,
+-    /// Median of per-window means — robust to a bad window
+-    /// without snapping (window means are not lattice-valued).
+-    pub median_window_ns: f64,
+-    /// Spread (max − min) of the window means — a dispersion
+-    /// signal for a CI and for regime-shift detection.
+-    pub window_spread_ns: f64,
+-    /// Minimum sample — the lattice floor, for comparison.
+-    pub min_ns: u64,
+-    /// Fraction of samples above [`DISTURBED_MULT`] x the
+-    /// low-quantile floor — the interference census.
+-    pub disturbed_frac: f64,
+-    /// Fraction of window means above [`DIRTY_WINDOW_TOL`] over
+-    /// the minimum window mean — how hard clean windows were to
+-    /// find.
+-    pub dirty_window_frac: f64,
+-}
+-
+-/// Apparatus-overhead model fitted by [`calibrate`].
+-#[derive(Debug)]
+-pub struct Overhead {
+-    /// Call-to-call cost of taking one sample (full timer-pair
+-    /// apparatus cost, clock-read latencies included), in ns —
+-    /// the window pass minus the loop-only pass. Sizes the
+-    /// experiment ([`crate::harness`]'s `pick_inner`); most of it
+-    /// sits *outside* recorded intervals, so it is never
+-    /// subtracted from reported values. Clamped at 0, with a
+-    /// warning, if the two passes disagree.
+-    pub frame_call_ns: f64,
+-    /// In-interval timer-pair slice a recorded sample contains,
+-    /// in ns — the dithered `N_LOW` window minimum minus the
+-    /// loop-only pass, both amortized per-sample costs over the
+-    /// same [`run_inner`]. Subtracted per sample (amortized by
+-    /// `inner`); see [`Overhead::adjust_per_call_ns`].
+-    pub frame_sample_ns: f64,
+-    /// Per-inner-iteration loop overhead (branch + `black_box`),
+-    /// in ns — the Theil-Sen slope across the loop-only ladder
+-    /// ([`Overhead::cal_loop_ladder`]). Subtracted per call.
+-    /// Also the frequency-regime fingerprint.
+-    pub loop_per_iter_ns: f64,
+-    /// Raw call-to-call window minimum at [`N_LOW`] (ns).
+-    /// Preserved for `-v` logging and cache provenance.
+-    pub cal_w_low_ns: f64,
+-    /// Raw loop-only window minimum at [`N_LOW`] (ns) — the same
+-    /// pass without the per-sample timer pair (the ladder's
+-    /// first point). `cal_w_low_ns` minus this is
+-    /// [`Overhead::frame_call_ns`].
+-    pub cal_l_low_ns: f64,
+-    /// The loop-only ladder: `(inner, min window mean ns/sample)`
+-    /// per [`LOOP_LADDER`] point. The Theil-Sen slope across it
+-    /// is [`Overhead::loop_per_iter_ns`]; the points feed the
+-    /// linearity diagnostic.
+-    pub cal_loop_ladder: Vec<(u64, f64)>,
+-    /// Raw dithered point at [`N_LOW`].
+-    pub cal_d_low: DitherPoint,
+-    /// Raw dithered point at [`N_HIGH`].
+-    pub cal_d_high: DitherPoint,
+-    /// Loop-only [`N_LOW`] floor measured first (right after
+-    /// warmup) and last — the drift bracket. Their relative
+-    /// difference is [`CalGrade::drift_frac`]; diagnostic only,
+-    /// no constant is derived from them.
+-    pub cal_l_start_ns: f64,
+-    /// See [`Overhead::cal_l_start_ns`].
+-    pub cal_l_end_ns: f64,
+-    /// Wall-clock duration of the full calibration run.
+-    pub cal_duration: Duration,
+-    /// Physical impossibilities detected in this result, empty
+-    /// when the calibration is self-consistent. Non-empty means
+-    /// the constants were kept only so the run can continue —
+-    /// report them rather than presenting the values as measured.
+-    pub violations: Vec<String>,
+-    /// Statistical self-check failures (D-or-worse signals) in
+-    /// plain language, empty on a healthy run. Unlike
+-    /// [`Overhead::violations`] these do not drive retries — they
+-    /// describe the environment, not a broken measurement model.
+-    pub warnings: Vec<String>,
+-    /// The environment grade synthesized from the self-check
+-    /// signals; finalized by [`calibrate`] once repeatability
+-    /// across attempts is known.
+-    pub grade: CalGrade,
+-}
+-
+-impl Overhead {
+-    /// Per-call apparatus overhead subtracted from reported values,
+-    /// in ns: the amortized loop cost plus the in-interval framing
+-    /// slice amortized by `inner`.
+-    ///
+-    /// - `frame_sample_ns` is the slice of timer cost recorded
+-    ///   intervals actually contain (±~0.1 ns run-to-run within
+-    ///   a frequency regime), not the call-to-call cost, most of
+-    ///   which falls outside them.
+-    pub fn adjust_per_call_ns(&self, inner: u64) -> f64 {
+-        self.frame_sample_ns / inner as f64 + self.loop_per_iter_ns
+-    }
+-}
+-
+-struct EmptyBench;
+-
+-impl Bench for EmptyBench {
+-    fn name(&self) -> &str {
+-        "empty"
+-    }
+-
+-    fn step(&mut self) -> u64 {
+-        black_box(1)
+-    }
+-}
+-
+-/// The inner loop, as one compiled copy shared by every
+-/// calibration pass.
+-///
+-/// - `#[inline(never)]` is load-bearing: `frame_call_ns` is a
+-///   difference of two passes, so any per-call-site codegen
+-///   difference in this loop lands in the result at full size.
+-///   One copy makes it cancel instead. See
+-///   notes/chores/chores-04.md#call-site-codegen-and-the-frame_call-subtraction.
+-/// - The call itself costs one call per *sample*, not per
+-///   iteration, so it does not enter `loop_per_iter_ns`; it is a
+-///   constant present in every pass, and cancels too.
+-#[inline(never)]
+-fn run_inner(bench: &mut EmptyBench, inner: u64) {
+-    for _ in 0..inner {
+-        black_box(bench.step());
+-    }
+-}
+-
+-/// Calibrate: collect [`CAL_CLEAN_ATTEMPTS`] violation-free
+-/// attempts (retrying dirty ones up to [`CAL_MAX_ATTEMPTS`]
+-/// total), publish the last clean one, and grade the environment.
+-///
+-/// - A violation (see [`Overhead::violations`]) means interference
+-///   corrupted the run, not that the apparatus is slow, so another
+-///   attempt on a quieter moment is the right response.
+-/// - The second clean attempt exists to measure repeatability —
+-///   the grade's headline number. Constants come from the last
+-///   clean attempt; the difference between the two is
+-///   [`CalGrade::repeat_ns`].
+-/// - When attempts run out, the best that exists is returned —
+-///   the last clean attempt (repeatability unknown, graded C at
+-///   best) or the last dirty one (graded F) — with its violations
+-///   attached for the caller to report. A clamped constant is
+-///   never passed off as a measurement.
+-pub fn calibrate() -> Overhead {
+-    let mut attempts: Vec<Overhead> = Vec::new();
+-    loop {
+-        let o = calibrate_once();
+-        if !o.violations.is_empty() {
+-            log::warn!(
+-                "calibration attempt {} of {CAL_MAX_ATTEMPTS} was physically impossible \
+-                 ({}); retrying",
+-                attempts.len() + 1,
+-                o.violations.join("; "),
+-            );
+-        }
+-        attempts.push(o);
+-        let clean = attempts.iter().filter(|a| a.violations.is_empty()).count();
+-        if clean >= CAL_CLEAN_ATTEMPTS || attempts.len() >= CAL_MAX_ATTEMPTS as usize {
+-            break;
+-        }
+-    }
+-
+-    let clean_idx: Vec<usize> = (0..attempts.len())
+-        .filter(|&i| attempts[i].violations.is_empty())
+-        .collect();
+-    let repeat = match clean_idx.as_slice() {
+-        [.., a, b] => Some(repeat_between(&attempts[*a], &attempts[*b])),
+-        _ => None,
+-    };
+-    let pick = clean_idx.last().copied().unwrap_or(attempts.len() - 1);
+-    // OK: obvious — no clean attempt falls back to the last (dirty) one;
+-    // the loop body ran at least once, so attempts is non-empty.
+-    let mut o = attempts.swap_remove(pick);
+-    finalize_grade(&mut o, repeat);
+-    o
+-}
+-
+-/// Worst relative and largest absolute (ns) constant change
+-/// between two clean attempts, as `(rel, ns)`.
+-///
+-/// - Relative covers all three constants (each against its own
+-///   scale); absolute covers the two ns-scale framing constants,
+-///   the "constants repeat to ±X ns" headline.
+-fn repeat_between(a: &Overhead, b: &Overhead) -> (f64, f64) {
+-    let rel = [
+-        (a.frame_call_ns, b.frame_call_ns),
+-        (a.frame_sample_ns, b.frame_sample_ns),
+-        (a.loop_per_iter_ns, b.loop_per_iter_ns),
+-    ]
+-    .into_iter()
+-    .map(|(x, y)| (x - y).abs() / y.abs().max(1e-9))
+-    .fold(0.0, f64::max);
+-    let ns = (a.frame_call_ns - b.frame_call_ns)
+-        .abs()
+-        .max((a.frame_sample_ns - b.frame_sample_ns).abs());
+-    (rel, ns)
+-}
+-
+-/// Fill in the published attempt's repeatability, final letter,
+-/// and plain-language warnings for every D-or-worse signal.
+-fn finalize_grade(o: &mut Overhead, repeat: Option<(f64, f64)>) {
+-    if let Some((rel, ns)) = repeat {
+-        o.grade.repeat_rel = Some(rel);
+-        o.grade.repeat_ns = Some(ns);
+-    }
+-    o.grade.letter = if o.violations.is_empty() {
+-        score_letter(o.grade.score())
+-    } else {
+-        'F'
+-    };
+-
+-    let g = &o.grade;
+-    let mut warn = |bad: bool, msg: String| {
+-        if bad {
+-            o.warnings.push(msg);
+-        }
+-    };
+-    warn(
+-        grade_score(g.disturbed_frac, grade_thresholds::DISTURBED) >= 3,
+-        format!(
+-            "environment noisy: {:.1}% of calibration samples were disturbed by \
+-             interference",
+-            g.disturbed_frac * 100.0
+-        ),
+-    );
+-    warn(
+-        grade_score(g.dirty_window_frac, grade_thresholds::DIRTY_WINDOWS) >= 3,
+-        format!(
+-            "environment noisy: {:.0}% of measurement windows ran slow (a continuous \
+-             competitor or heavy load)",
+-            g.dirty_window_frac * 100.0
+-        ),
+-    );
+-    warn(
+-        grade_score(g.drift_frac, grade_thresholds::DRIFT) >= 3,
+-        format!(
+-            "machine speed changed {:.1}% during calibration (frequency or thermal \
+-             shift); paired constants may not match each other",
+-            g.drift_frac * 100.0
+-        ),
+-    );
+-    warn(
+-        grade_score(g.max_resid_frac, grade_thresholds::RESID) >= 3,
+-        format!(
+-            "loop ladder deviates {:.1}% from the linear model; the slope is suspect",
+-            g.max_resid_frac * 100.0
+-        ),
+-    );
+-    warn(
+-        grade_score(g.slope_cross_frac, grade_thresholds::CROSS) >= 3,
+-        format!(
+-            "independent slope estimates differ {:.1}%; the calibration model is \
+-             suspect",
+-            g.slope_cross_frac * 100.0
+-        ),
+-    );
+-    match g.repeat_rel {
+-        Some(r) => warn(
+-            grade_score(r, grade_thresholds::REPEAT) >= 3,
+-            format!(
+-                "calibration constants differ {:.1}% between attempts; treat results \
+-                 as unreliable",
+-                r * 100.0
+-            ),
+-        ),
+-        None => warn(
+-            true,
+-            "repeatability unknown: fewer than two calibration attempts came out \
+-             clean"
+-                .to_string(),
+-        ),
+-    }
+-}
+-
+-/// One calibration pass: the loop-only ladder, the call-to-call
+-/// window pass, the two dithered points, and a drift bracket
+-/// (loop-only [`N_LOW`] floor first and last). Blocks for
+-/// ~0.5-1 s release (several seconds unoptimized) on a typical
+-/// modern x86; logs raw points and the alternative fits at debug
+-/// level. [`calibrate`] runs it at least twice.
+-fn calibrate_once() -> Overhead {
+-    let mut bench = EmptyBench;
+-    let mut dither = Dither::new();
+-    let cal_start = Instant::now();
+-    for _ in 0..CAL_WARMUP {
+-        black_box(bench.step());
+-    }
+-
+-    // Drift bracket, opening side: every paired difference below
+-    // assumes machine state holds across the pair, and a debug
+-    // run has been observed breaking that (a frequency-regime
+-    // shift mid-calibration drove frame/sample to 88 ns against
+-    // frame/call 39). The same measurement repeated first and
+-    // last makes the assumption checkable.
+-    let l_start = measure_loop_only(&mut bench, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+-
+-    // d_low shares the loop-only pass's window shape: its
+-    // min_window_ns is differenced against l_low below, and
+-    // differenced passes need identical window shapes (count and
+-    // duration) or their min-over-windows aren't comparable.
+-    let d_low = dither_measure(&mut dither, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+-    let d_high = dither_measure(&mut dither, DITHER_WINDOWS, DITHER_HIGH_SAMPLES, N_HIGH);
+-    log_dither_point("d_low", &d_low);
+-    log_dither_point("d_high", &d_high);
+-    log_alt_fits(&d_low, &d_high);
+-
+-    // Call-to-call: two window passes at N_LOW differing only in
+-    // the per-sample timer pair, so the loop term cancels in the
+-    // subtraction rather than being estimated from the dithered
+-    // slope (a different call site, and in an unoptimized build a
+-    // ~12% different loop — see
+-    // notes/chores/chores-04.md#call-site-codegen-and-the-frame_call-subtraction).
+-    let w_low = measure_window(&mut bench, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+-    let cal_loop_ladder: Vec<(u64, f64)> = LOOP_LADDER
+-        .iter()
+-        .map(|&n| {
+-            (
+-                n,
+-                measure_loop_only(&mut bench, W_LOW_WINDOWS, loop_samples(n), n),
+-            )
+-        })
+-        .collect();
+-    let l_low = cal_loop_ladder[0].1;
+-    let frame_call_raw = w_low - l_low;
+-
+-    // Production slope: Theil-Sen across the loop-only ladder —
+-    // no per-sample timer reads, so no lattice to de-bias, and
+-    // the median of pairwise slopes resists a contaminated point.
+-    let loop_per_iter_ns = theil_sen_slope(&cal_loop_ladder);
+-    for &(n, per_sample) in &cal_loop_ladder {
+-        log::debug!(
+-            "loop ladder: N={n:<6} {per_sample:.4} ns/sample ({:.6} ns/iter, \
+-             resid={:+.4} ns vs slope from l_low)",
+-            per_sample / n as f64,
+-            per_sample - (l_low + (n - N_LOW) as f64 * loop_per_iter_ns),
+-        );
+-    }
+-
+-    // The dithered two-point fit, demoted to a diagnostic: its
+-    // slope diverging from the loop-only slope is the check on
+-    // the assumption that the loop costs the same with and
+-    // without timer pairs interleaved.
+-    let (fit_intercept, fit_slope) = two_point_fit(
+-        d_low.low_q_ns[DITHER_PROD_Q],
+-        d_high.low_q_ns[DITHER_PROD_Q],
+-    );
+-    log::debug!(
+-        "slope cross-check: loop-only={loop_per_iter_ns:.6} ns/iter, \
+-         dithered-fit={fit_slope:.6} ns/iter"
+-    );
+-
+-    // frame_sample is *not* taken from that intercept: it is a
+-    // difference of two same-N measurements over the same
+-    // run_inner, so no long point can lever it negative. Both
+-    // terms are amortized per-sample costs, min over windows.
+-    let frame_sample_raw = d_low.min_window_ns - l_low;
+-    log::debug!(
+-        "frame_sample: paired={frame_sample_raw:.4} ns (d_low_minwin={:.4}, l_low={l_low:.4}), \
+-         fit-intercept={fit_intercept:.4} ns",
+-        d_low.min_window_ns,
+-    );
+-    log::debug!(
+-        "frame_call: paired={frame_call_raw:.4} ns (w_low={w_low:.4}, l_low={l_low:.4}), \
+-         slope-based={:.4} ns",
+-        w_low - N_LOW as f64 * loop_per_iter_ns,
+-    );
+-
+-    // Physical plausibility. These are not statistical tests: each
+-    // one is a statement that cannot be false of a real apparatus,
+-    // so a failure means the measurement is invalid, not unlucky.
+-    let mut violations = Vec::new();
+-    if loop_per_iter_ns <= 0.0 {
+-        violations.push(format!(
+-            "loop/iter is non-positive ({loop_per_iter_ns:.6} ns): an iteration \
+-             cannot cost nothing"
+-        ));
+-    }
+-    if frame_call_raw <= 0.0 {
+-        violations.push(format!(
+-            "frame/call is non-positive ({frame_call_raw:.4} ns; w_low={w_low:.4}, \
+-             l_low={l_low:.4}): taking a sample cannot cost nothing"
+-        ));
+-    }
+-    if frame_sample_raw < 0.0 {
+-        violations.push(format!(
+-            "frame/sample is negative ({frame_sample_raw:.4} ns; d_low_minwin={:.4}, \
+-             l_low={l_low:.4}): a timed interval cannot be shorter than the loop it contains",
+-            d_low.min_window_ns,
+-        ));
+-    }
+-    if frame_sample_raw > frame_call_raw {
+-        violations.push(format!(
+-            "frame/sample ({frame_sample_raw:.4} ns) exceeds frame/call \
+-             ({frame_call_raw:.4} ns): the timer cost inside the interval cannot \
+-             exceed the whole timer cost"
+-        ));
+-    }
+-
+-    let frame_call_ns = frame_call_raw.max(0.0);
+-    let frame_sample_ns = frame_sample_raw.max(0.0);
+-
+-    // Drift bracket, closing side, then the statistical
+-    // self-check signals. These are graded, not asserted: unlike
+-    // the violations above, a bad value describes the
+-    // environment, not an impossible measurement.
+-    let l_end = measure_loop_only(&mut bench, W_LOW_WINDOWS, W_LOW_SAMPLES, N_LOW);
+-    let drift_frac = (l_end - l_start).abs() / l_start.max(1e-9);
+-
+-    // Linearity: residuals of the ladder points against the
+-    // Theil-Sen line, anchored at the median intercept so no one
+-    // point (not even l_low) is privileged.
+-    let mut intercepts: Vec<f64> = cal_loop_ladder
+-        .iter()
+-        .map(|&(n, p)| p - loop_per_iter_ns * n as f64)
+-        .collect();
+-    intercepts.sort_unstable_by(|a, b| a.total_cmp(b));
+-    let intercept = intercepts[intercepts.len() / 2];
+-    let max_resid_frac = cal_loop_ladder
+-        .iter()
+-        .map(|&(n, p)| {
+-            let predicted = intercept + loop_per_iter_ns * n as f64;
+-            (p - predicted).abs() / p.max(1e-9)
+-        })
+-        .fold(0.0, f64::max);
+-
+-    let slope_cross_frac = (fit_slope - loop_per_iter_ns).abs() / loop_per_iter_ns.abs().max(1e-9);
+-
+-    let grade = CalGrade {
+-        disturbed_frac: d_low.disturbed_frac.max(d_high.disturbed_frac),
+-        dirty_window_frac: d_low.dirty_window_frac.max(d_high.dirty_window_frac),
+-        drift_frac,
+-        max_resid_frac,
+-        slope_cross_frac,
+-        repeat_rel: None,
+-        repeat_ns: None,
+-        letter: 'F', // placeholder; finalize_grade() sets it
+-    };
+-    log::debug!(
+-        "self-checks: disturbed={:.4} dirty_win={:.4} drift={:.4} resid={:.4} cross={:.4} \
+-         (l_start={l_start:.4}, l_end={l_end:.4})",
+-        grade.disturbed_frac,
+-        grade.dirty_window_frac,
+-        grade.drift_frac,
+-        grade.max_resid_frac,
+-        grade.slope_cross_frac,
+-    );
+-
+-    Overhead {
+-        frame_call_ns,
+-        frame_sample_ns,
+-        loop_per_iter_ns,
+-        cal_w_low_ns: w_low,
+-        cal_l_low_ns: l_low,
+-        cal_loop_ladder,
+-        cal_d_low: d_low,
+-        cal_d_high: d_high,
+-        cal_l_start_ns: l_start,
+-        cal_l_end_ns: l_end,
+-        cal_duration: cal_start.elapsed(),
+-        violations,
+-        warnings: Vec::new(),
+-        grade,
+-    }
+-}
+-
+-/// Measure one dithered point: `windows` windows of `samples`
+-/// samples at the given `inner`, each sample preceded by a random
+-/// sub-quantum [`Dither::spin`] outside the timed interval.
+-fn dither_measure(dither: &mut Dither, windows: u64, samples: u64, inner: u64) -> DitherPoint {
+-    let mut bench = EmptyBench;
+-    let mut all: Vec<u64> = Vec::with_capacity((windows * samples) as usize);
+-    let mut window_means: Vec<f64> = Vec::with_capacity(windows as usize);
+-    for _ in 0..windows {
+-        let mut sum: u128 = 0;
+-        for _ in 0..samples {
+-            dither.spin();
+-            let start = Instant::now();
+-            run_inner(&mut bench, inner);
+-            let e = start.elapsed().as_nanos() as u64;
+-            sum += u128::from(e);
+-            all.push(e);
+-        }
+-        window_means.push(sum as f64 / samples as f64);
+-    }
+-
+-    all.sort_unstable();
+-    let n = all.len();
+-    let mean_ns = all.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+-    let n99 = (n as f64 * 0.99).ceil() as usize;
+-    let mean_p99_ns = all[..n99].iter().map(|&v| v as f64).sum::<f64>() / n99 as f64;
+-
+-    window_means.sort_unstable_by(|a, b| a.total_cmp(b));
+-    let median_window_ns = window_means[window_means.len() / 2];
+-    let window_spread_ns = window_means[window_means.len() - 1] - window_means[0];
+-    let fast = (DITHER_FAST_WINDOWS as usize).clamp(1, window_means.len());
+-    let mean_fast_ns = window_means[..fast].iter().sum::<f64>() / fast as f64;
+-
+-    let mut low_q_ns = [0.0; DITHER_LOW_Q.len()];
+-    for (slot, frac) in low_q_ns.iter_mut().zip(DITHER_LOW_Q) {
+-        let idx = ((n as f64 * frac) as usize).min(n - 1);
+-        *slot = all[idx] as f64;
+-    }
+-
+-    // The interference census, over the sorted samples: everything
+-    // above the census line was hit. See DISTURBED_ABS_NS for why
+-    // the bound has an absolute part.
+-    let floor = low_q_ns[DITHER_PROD_Q];
+-    let disturbed_bound = (floor * DISTURBED_MULT).max(floor + DISTURBED_ABS_NS);
+-    let first_disturbed = all.partition_point(|&v| (v as f64) <= disturbed_bound);
+-    let disturbed_frac = (n - first_disturbed) as f64 / n as f64;
+-
+-    // Same census at window granularity (window_means is sorted).
+-    let dirty_bound = window_means[0] * (1.0 + DIRTY_WINDOW_TOL);
+-    let first_dirty = window_means.partition_point(|&w| w <= dirty_bound);
+-    let dirty_window_frac = (window_means.len() - first_dirty) as f64 / window_means.len() as f64;
+-
+-    DitherPoint {
+-        mean_ns,
+-        mean_p99_ns,
+-        mean_fast_ns,
+-        low_q_ns,
+-        min_window_ns: window_means[0],
+-        median_window_ns,
+-        window_spread_ns,
+-        min_ns: all[0],
+-        disturbed_frac,
+-        dirty_window_frac,
+-    }
+-}
+-
+-/// Amortized per-sample cost at a given `inner`: each window times
+-/// `samples` complete samples (timer pair around an `inner`-iteration
+-/// loop — the exact shape the harness takes one at a time) and
+-/// divides by the count, so quantization error is q/samples; the
+-/// minimum over `windows` windows is returned, in ns.
+-fn measure_window(bench: &mut EmptyBench, windows: u64, samples: u64, inner: u64) -> f64 {
+-    let mut min_ns = f64::INFINITY;
+-    for _ in 0..windows {
+-        let window = Instant::now();
+-        for _ in 0..samples {
+-            let start = Instant::now();
+-            run_inner(bench, inner);
+-            black_box(start.elapsed());
+-        }
+-        let per_sample = window.elapsed().as_nanos() as f64 / samples as f64;
+-        if per_sample < min_ns {
+-            min_ns = per_sample;
+-        }
+-    }
+-    min_ns
+-}
+-
+-/// [`measure_window`] with the per-sample timer pair removed: the
+-/// loop's own cost per `inner` iterations, same window shape, same
+-/// min-over-windows estimator, same [`run_inner`].
+-///
+-/// - Paired with [`measure_window`], the difference is the
+-///   call-to-call framing cost with the loop term cancelled
+-///   exactly — no fitted slope, no second call site.
+-fn measure_loop_only(bench: &mut EmptyBench, windows: u64, samples: u64, inner: u64) -> f64 {
+-    let mut min_ns = f64::INFINITY;
+-    for _ in 0..windows {
+-        let window = Instant::now();
+-        for _ in 0..samples {
+-            run_inner(bench, inner);
+-        }
+-        let per_sample = window.elapsed().as_nanos() as f64 / samples as f64;
+-        if per_sample < min_ns {
+-            min_ns = per_sample;
+-        }
+-    }
+-    min_ns
+-}
+-
+-/// Theil-Sen slope over `(inner, per-sample ns)` ladder points:
+-/// the median of all pairwise slopes, in ns per iteration.
+-///
+-/// - Robust to a contaminated point: with 5 ladder points (10
+-///   pairs), up to 4 pairs can be corrupted before the median
+-///   moves — a mean-based fit moves on the first.
+-/// - The per-sample constant term (the `run_inner` call, window
+-///   framing) cancels in every pairwise difference, so only the
+-///   per-iteration cost survives.
+-fn theil_sen_slope(points: &[(u64, f64)]) -> f64 {
+-    let mut slopes: Vec<f64> = Vec::with_capacity(points.len() * (points.len() - 1) / 2);
+-    for (i, &(n_i, p_i)) in points.iter().enumerate() {
+-        for &(n_j, p_j) in &points[i + 1..] {
+-            slopes.push((p_j - p_i) / (n_j - n_i) as f64);
+-        }
+-    }
+-    slopes.sort_unstable_by(|a, b| a.total_cmp(b));
+-    let mid = slopes.len() / 2;
+-    if slopes.len() % 2 == 1 {
+-        slopes[mid]
+-    } else {
+-        (slopes[mid - 1] + slopes[mid]) / 2.0
+-    }
+-}
+-
+-/// Two-point linear fit over the [`N_LOW`] / [`N_HIGH`] pair,
+-/// shared by the diagnostic fits (the alternative-fit logging and
+-/// the `calibrate` command's diagnostic output). Returns
+-/// `(intercept_ns, slope_ns)`; the slope clamps to 0 when the
+-/// points invert, and the intercept is left unclamped (a negative
+-/// value is itself a diagnostic signal).
+-pub fn two_point_fit(low_ns: f64, high_ns: f64) -> (f64, f64) {
+-    let slope = if high_ns > low_ns {
+-        (high_ns - low_ns) / (N_HIGH - N_LOW) as f64
+-    } else {
+-        0.0
+-    };
+-    (low_ns - N_LOW as f64 * slope, slope)
+-}
+-
+-/// Debug-log one dithered point's aggregates.
+-fn log_dither_point(name: &str, p: &DitherPoint) {
+-    log::debug!(
+-        "dither {name}: mean={:.4} p99mean={:.4} fast={:.4} medwin={:.4} spread={:.4} min={} ns",
+-        p.mean_ns,
+-        p.mean_p99_ns,
+-        p.mean_fast_ns,
+-        p.median_window_ns,
+-        p.window_spread_ns,
+-        p.min_ns,
+-    );
+-}
+-
+-/// Debug-log the diagnostic two-point fits (every
+-/// [`fit_candidates`] entry) so estimator agreement stays
+-/// observable run to run — their divergence from each other and
+-/// from the loop-only slope is a contamination signal.
+-fn log_alt_fits(d_low: &DitherPoint, d_high: &DitherPoint) {
+-    for (kind, low, high) in fit_candidates(d_low, d_high) {
+-        let (intercept, slope) = two_point_fit(low, high);
+-        log::debug!(
+-            "dither fit({kind}): in-interval framing={intercept:.4} ns, loop_per_iter={slope:.6} ns"
+-        );
+-    }
+-}
+-
+-/// Every aggregation the two points can be fitted through, as
+-/// `(label, low, high)` — the single list behind both the `-v`
+-/// debug log and the `calibrate` command's stdout block, so the
+-/// two can't drift.
+-///
+-/// - The means come first, then one entry per [`DITHER_LOW_Q`]
+-///   discard fraction. All are diagnostics: the production slope
+-///   is the loop-only Theil-Sen, and the cross-check reads the
+-///   `lowq` entry at [`DITHER_PROD_Q`].
+-pub fn fit_candidates(d_low: &DitherPoint, d_high: &DitherPoint) -> Vec<(String, f64, f64)> {
+-    let mut out = vec![
+-        ("full".to_string(), d_low.mean_ns, d_high.mean_ns),
+-        ("p99".to_string(), d_low.mean_p99_ns, d_high.mean_p99_ns),
+-        ("fast".to_string(), d_low.mean_fast_ns, d_high.mean_fast_ns),
+-        (
+-            "medwin".to_string(),
+-            d_low.median_window_ns,
+-            d_high.median_window_ns,
+-        ),
+-    ];
+-    for (i, frac) in DITHER_LOW_Q.iter().enumerate() {
+-        out.push((
+-            format!("lowq{:.1}%", frac * 100.0),
+-            d_low.low_q_ns[i],
+-            d_high.low_q_ns[i],
+-        ));
+-    }
+-    out
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn theil_sen_is_median_of_pairwise_slopes() {
+-        // Perfect line: every pairwise slope is 2.0.
+-        let line: Vec<(u64, f64)> = vec![(100, 210.0), (300, 610.0), (1000, 2010.0)];
+-        assert!((theil_sen_slope(&line) - 2.0).abs() < 1e-12);
+-
+-        // One wildly contaminated point out of five leaves the
+-        // median pairwise slope on the clean value.
+-        let dirty: Vec<(u64, f64)> = vec![
+-            (100, 210.0),
+-            (300, 610.0),
+-            (1000, 9999.0), // contaminated
+-            (3000, 6010.0),
+-            (10000, 20010.0),
+-        ];
+-        assert!((theil_sen_slope(&dirty) - 2.0).abs() < 1e-9);
+-    }
+-
+-    #[test]
+-    fn grade_score_counts_crossed_cutoffs() {
+-        let cutoffs = [0.01, 0.02, 0.05, 0.10];
+-        assert_eq!(grade_score(0.0, cutoffs), 0);
+-        assert_eq!(grade_score(0.01, cutoffs), 0); // boundary is inclusive-below
+-        assert_eq!(grade_score(0.015, cutoffs), 1);
+-        assert_eq!(grade_score(0.04, cutoffs), 2);
+-        assert_eq!(grade_score(0.07, cutoffs), 3);
+-        assert_eq!(grade_score(0.5, cutoffs), 4);
+-    }
+-
+-    #[test]
+-    fn grade_letter_maps_and_worst_signal_wins() {
+-        assert_eq!(score_letter(0), 'A');
+-        assert_eq!(score_letter(4), 'F');
+-        let mut g = CalGrade {
+-            disturbed_frac: 0.0,
+-            dirty_window_frac: 0.0,
+-            drift_frac: 0.0,
+-            max_resid_frac: 0.0,
+-            slope_cross_frac: 0.0,
+-            repeat_rel: Some(0.0),
+-            repeat_ns: Some(0.0),
+-            letter: 'F',
+-        };
+-        assert_eq!(score_letter(g.score()), 'A');
+-        g.drift_frac = 0.06; // crosses A, B, C cutoffs -> D
+-        assert_eq!(score_letter(g.score()), 'D');
+-        g.drift_frac = 0.0;
+-        g.repeat_rel = None; // unknown repeatability floors at C
+-        assert_eq!(score_letter(g.score()), 'C');
+-    }
+-}
+diff --git a/src/pin.rs b/src/pin.rs
+index 1a10f6d7e4..7a6454fe5d 100644
+--- a/src/pin.rs
++++ b/src/pin.rs
+@@ -77,8 +77,9 @@
+     }
+ }
+ 
+-/// Restore a previously-saved affinity mask. Used after calibration
+-/// to widen the mask back to what we started with (typically "all
++/// Restore a previously-saved affinity mask. Used after the
++/// tick-rate warm to widen the mask back to what we started with
++/// (typically "all
+ /// CPUs the process was launched with", preserving any outer
+ /// `taskset` restrictions). Logs the restored mask at `info` level.
+ pub fn restore_affinity(set: &libc::cpu_set_t) {
+diff --git a/src/probe.rs b/src/probe.rs
+index 0ece28848a..9ae5e68be2 100644
+--- a/src/probe.rs
++++ b/src/probe.rs
+@@ -83,9 +83,9 @@
+     }
+ 
+     /// Render a band-table report for this probe, indented one
+-    /// level deeper than the enclosing bench's report. No
+-    /// `adjusted` column — probe overhead subtraction is a
+-    /// separate concern. Bands are right-closed `(lower, upper]`
++    /// level deeper than the enclosing bench's report. Values are
++    /// raw, like the harness report's. Bands are right-closed
++    /// `(lower, upper]`
+     /// (see [`band_index`]), matching the harness report.
+     /// `decimals` (`--decimals`) applies to the computed mean and
+     /// stdev columns; `first`/`last`/`range` are recorded integer
+diff --git a/tests/qualify_environment.rs b/tests/qualify_environment.rs
+index 12be2e3348..3be6cb9cdf 100644
+--- a/tests/qualify_environment.rs
++++ b/tests/qualify_environment.rs
+@@ -21,15 +21,15 @@
+ //! - **The observable is the environment grade**, not the run
+ //!   grade: this is a test of the box, and the environment
+ //!   stretches are the workload-independent ones. It migrated
+-//!   there from the `calibrate` environment letter, which
+-//!   0.23.0-7 deletes.
++//!   there from the startup `calibrate` environment letter, which
++//!   0.23.0-7 deleted.
+ //! - `#[ignore]`d: machine-specific physics, meaningful only on a
+ //!   box that shows the two-state relaxation, run alone on a
+ //!   quiet system:
+ //!   `cargo test --release --test qualify_environment -- --ignored`
+ //! - **Use `--release`.** `cargo test` otherwise builds a debug
+ //!   binary, and each child then spends ~20 s in unoptimized
+-//!   calibration and warmup against ~2 s optimized — 200 s for
++//!   warmup against ~2 s optimized, so 200 s for
+ //!   the default ten runs. It is also the less representative
+ //!   measurement: the child's own phases are what provoke the
+ //!   box's state change, so they should run at the speed a real
