@@ -94,7 +94,13 @@
       "Bash(./target/release/iiac-perf min-now *)",
       "Read(//home/wink/data/prgs/rust/vc-x1-template/**)",
       "Read(//home/wink/data/prgs/rust/vc-x1-template/messages/**)",
-      "Bash(RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --document-private-items)"
+      "Bash(RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --document-private-items)",
+      "Read(//home/wink/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iceoryx2-pal-posix-0.9.2/src/linux/**)",
+      "Read(//home/wink/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/**)",
+      "Bash(echo \"exit=$? \\(0 means byte-identical\\)\")",
+      "Bash(echo \"fmt=$?\")",
+      "Bash(echo \"clippy=$?\")",
+      "Bash(echo \"test=$?\")"
     ]
   }
 }
