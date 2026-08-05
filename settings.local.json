@@ -91,7 +91,10 @@
       "Bash(timeout 60 ssh -o BatchMode=yes 7600x 'cd data/prgs/rust/iiac-perf && git status --short && git apply - && echo \"--- applied ---\" && git status --short && git log --oneline -1')",
       "Bash(echo \"local:  $\\(rustc -V\\)\")",
       "Bash(timeout 15 ssh -o BatchMode=yes 7600x 'echo \"7600x:  $\\(rustc -V\\)\"; ls -d ~/data/prgs/rust/iiac-perf 2>/dev/null || echo \"no repo checkout\"')",
-      "Bash(./target/release/iiac-perf min-now *)"
+      "Bash(./target/release/iiac-perf min-now *)",
+      "Read(//home/wink/data/prgs/rust/vc-x1-template/**)",
+      "Read(//home/wink/data/prgs/rust/vc-x1-template/messages/**)",
+      "Bash(RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --document-private-items)"
     ]
   }
 }
