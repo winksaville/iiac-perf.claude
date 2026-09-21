@@ -102,5 +102,9 @@
       "Bash(echo \"clippy=$?\")",
       "Bash(echo \"test=$?\")"
     ]
+  },
+  "sandbox": {
+    "enabled": false,
+    "autoAllowBashIfSandboxed": false
   }
 }
